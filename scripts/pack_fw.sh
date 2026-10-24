@@ -257,10 +257,11 @@ make_partition_image() {
 # so each supported model needs its own line.
 # A model absent here builds with the size check skipped (a warning, not a wrong assertion).
 #   y20 (Yi 1080p Home, Hi3518Ev200, 16MB): mtd4 rootfs 0x140000, mtd5 home 0xcb0000
+#   h20 (Yi 1080p Dome, Hi3518Ev200, 16MB MX25L128): same table as y20
 partition_limit() {   # partition_limit <model> <rootfs|home> -> bytes (empty if unknown)
     case "$1:$2" in
-        y20:rootfs) echo $((0x140000)) ;;
-        y20:home)   echo $((0xcb0000)) ;;
+        y20:rootfs|h20:rootfs) echo $((0x140000)) ;;
+        y20:home|h20:home)     echo $((0xcb0000)) ;;
         *)          : ;;
     esac
 }

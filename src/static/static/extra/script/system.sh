@@ -334,7 +334,7 @@ if [[ $NATIVE_PIPELINE == "no" ]] && [[ $DISABLE_CLOUD == "no" ]] ; then
         fi
         ./cloud &
         ./p2p_tnp &
-        if [[ $MODEL_SUFFIX != "yi_dome" ]] ; then
+        if [[ $MODEL_SUFFIX != "yi_dome" ]] && [[ $MODEL_SUFFIX != "v201" ]] ; then
             # oss hardware-encrypts uploaded media via /dev/cipher and is the only
             # runtime user of hi_cipher.ko (cloudAPI uses software CyaSSL). Load the
             # module here: it was removed from the stock app/init.sh unconditional
@@ -495,7 +495,7 @@ RRTSP_PWD=$RTSP_PASSWORD
 
 if [[ $RTSP_ENABLED == "yes" ]] ; then
 
-    if [[ $MODEL_SUFFIX == "yi_dome" ]] || [[ $MODEL_SUFFIX == "yi_home" ]] ; then
+    if [[ $MODEL_SUFFIX == "yi_dome" ]] || [[ $MODEL_SUFFIX == "yi_home" ]] || [[ $MODEL_SUFFIX == "v201" ]] || [[ $MODEL_SUFFIX == "y18" ]] ; then
         HIGHWIDTH="1280"
         HIGHHEIGHT="720"
     else
@@ -589,7 +589,7 @@ if [[ $ONVIF_ENABLED == "yes" ]] ; then
         echo "" >> $ONVIF_SRVD_CONF
     fi
 
-    if [[ $MODEL_SUFFIX == "yi_dome" ]] || [[ $MODEL_SUFFIX == "yi_dome_1080p" ]] || [[ $MODEL_SUFFIX == "yi_cloud_dome_1080p" ]] ; then
+    if [[ $MODEL_SUFFIX == "yi_dome" ]] || [[ $MODEL_SUFFIX == "yi_dome_1080p" ]] || [[ $MODEL_SUFFIX == "yi_cloud_dome_1080p" ]] || [[ $MODEL_SUFFIX == "v201" ]] || [[ $MODEL_SUFFIX == "h20" ]] || [[ $MODEL_SUFFIX == "y19" ]] ; then
         echo "#PTZ" >> $ONVIF_SRVD_CONF
         echo "ptz=1" >> $ONVIF_SRVD_CONF
         echo "get_position=/home/yi-hack/extra/bin/ipc_cmd -g" >> $ONVIF_SRVD_CONF

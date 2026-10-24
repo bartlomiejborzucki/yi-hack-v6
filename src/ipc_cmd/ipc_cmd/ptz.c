@@ -15,7 +15,11 @@
 int is_ptz(char *model) {
     if ((strcmp("yi_dome", model) == 0) ||
             (strcmp("yi_dome_1080p", model) == 0) ||
-            (strcmp("yi_cloud_dome_1080p", model) == 0)) {
+            (strcmp("yi_cloud_dome_1080p", model) == 0) ||
+            /* v6 ships the firmware code in .camver instead of the model name */
+            (strcmp("v201", model) == 0) ||
+            (strcmp("h20", model) == 0) ||
+            (strcmp("y19", model) == 0)) {
 
         return V5;
 
