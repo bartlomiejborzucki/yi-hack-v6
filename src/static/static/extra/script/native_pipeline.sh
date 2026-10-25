@@ -90,6 +90,14 @@ else
     C_LDC=0
 fi
 
+# h20 builds may use the public SDK 1.0.3.0, whose VENC rejects campipe's 1.0.4.0-
+# validated stream buffers (CreateChn 0xa0088003): it wants at least w*h for H.264
+# and w*align16(h) for JPEG (1920x1088 = 2040KB). Size them up via campipe's env
+# overrides; the low JPEG default (w*h*2) is already large enough.
+if [ "$MODEL_SUFFIX" = "h20" ] ; then
+    export CAMPIPE_H264HI_KB=2025 CAMPIPE_H264LO_KB=225 CAMPIPE_JPEGHI_KB=2048
+fi
+
 # --- 3. rRTSPServer params ---------------------------------------------------
 # One fork-free batch read (the old form forked ~8 get_config subshells, several
 # on the SAME key). USER pre-cleared: it exists in the environment.
