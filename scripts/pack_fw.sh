@@ -194,6 +194,16 @@ if [ \"\$(sed -n 's/^DEBUG_LOG=//p' /home/yi-hack/config/system.conf 2>/dev/null
 	exec >> /tmp/sd/yi-boot.log 2>&1
 	echo '===== [bootlog] DEBUG_LOG=early: live on SD /tmp/sd (-o sync) from base/init.sh ====='
 fi"
+
+    # Stock dispatch (h20) runs app/script/mount_sd.sh ('umount -l /tmp/sd; mount ...') after
+    # S20 has built the view. The lazy umount detaches the SD under the running system: the
+    # extra/www symlinks into /tmp/sd dangle and every LD_PRELOAD of ipc_multiplex.so fails.
+    # base/init.sh already owns the SD mount -> only mount it here if it is missing.
+    local msd="$1/app/script/mount_sd.sh"
+    if [ -f "$msd" ]; then
+        printf '%s\n' 'grep -q " /tmp/sd " /proc/mounts || mount /dev/mmcblk0p1 /tmp/sd' > "$msd"
+        chmod 0755 "$msd"
+    fi
 }
 
 # Bake the cloudAPI + udhcpc "first-boot file placement" into the home image at BUILD time.
