@@ -290,6 +290,13 @@ pack_model() {
     log "$MODEL: copying stock home..."
     cp -a "$MODEL_STOCK/home_extracted" "$IMG_DIR/home"
 
+    # A base taken from a yi-hack-v5 image (instead of a pristine Xiaomi one) still holds
+    # v5's per-file .7z (rmm.7z, oss.7z, p2p_tnp.7z, ...), which v5 unpacked at first boot.
+    # v6 does not, so the stock stack would boot without rmm and dispatch reboots the
+    # camera. Refuse such a base: unpack the archives in stock_firmware/ first.
+    local packed; packed=$(find "$IMG_DIR/rootfs" "$IMG_DIR/home" -name '*.7z' | sed "s|$IMG_DIR/||")
+    [ -z "$packed" ] || die "$MODEL: stock base still has v5 .7z archives (unpack them in stock_firmware/$MODEL): $(echo $packed)"
+
     # --- Step 2: fold in stock OTA update(s) so the base is current before our overlay ---
     log "$MODEL: applying stock firmware update(s)..."
     apply_stock_updates "$IMG_DIR/home" "$MODEL_STOCK"
