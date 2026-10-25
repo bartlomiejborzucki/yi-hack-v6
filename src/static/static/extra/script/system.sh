@@ -245,7 +245,7 @@ mkdir -p /tmp/ipc
 # watchdog; since we skip it, we feed /dev/watchdog ourselves (NOW, before the
 # ~10s module reload).
 #
-# Safety: native activates only if MODEL=y20 AND the SDK modules + campipe are
+# Safety: native activates only if MODEL=y20/h20 AND the SDK modules + campipe are
 # present - otherwise it silently stays stock (so a native config on a build
 # without the assets never breaks boot). Physical escape hatch that survives a
 # bad flash config: `touch /tmp/sd/NO_NATIVE` forces stock regardless of the
@@ -262,7 +262,7 @@ NATIVE_BIN=/home/yi-hack/extra/bin/campipe
 
 NATIVE_PIPELINE=no
 if { [ "$PIPELINE_MODE" = "online" ] || [ "$PIPELINE_MODE" = "offline" ]; } \
-   && [ "$MODEL_SUFFIX" = "y20" ] \
+   && { [ "$MODEL_SUFFIX" = "y20" ] || [ "$MODEL_SUFFIX" = "h20" ]; } \
    && [ -f "$NATIVE_KO_DIR/load3518e" ] && [ -x "$NATIVE_BIN" ] ; then
     NATIVE_PIPELINE=yes
     NATIVE_LDC=0
