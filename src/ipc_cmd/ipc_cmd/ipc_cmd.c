@@ -56,6 +56,42 @@ void ipc_stop()
     }
 }
 
+/* PTZ without dispatch (native pipeline). Degrees use the same scale as -g. */
+int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get_pos, int calibrate)
+{
+    int cur_x, cur_y;
+
+    if (calibrate)
+        return native_ptz_calibrate();
+
+    if (move == MOVE_STOP)
+        return native_ptz_stop();
+    if (move == MOVE_UP)
+        return native_ptz_move(NATIVE_UP);
+    if (move == MOVE_DOWN)
+        return native_ptz_move(NATIVE_DOWN);
+    if (move == MOVE_LEFT)
+        return native_ptz_move(NATIVE_LEFT);
+    if (move == MOVE_RIGHT)
+        return native_ptz_move(NATIVE_RIGHT);
+
+    if (jump_abs || jump_rel || get_pos) {
+        if (read_ptz(&cur_x, &cur_y) != 0) {
+            fprintf(stderr, "Error reading current ptz position\n");
+            return -1;
+        }
+    }
+    if (jump_abs)
+        return native_ptz_jump((int) round(x * MAX_PTZ_X / 360.0), (int) round(y * MAX_PTZ_Y / 180.0));
+    if (jump_rel)
+        return native_ptz_jump(cur_x + (int) round(x * MAX_PTZ_X / 360.0), cur_y + (int) round(y * MAX_PTZ_Y / 180.0));
+    if (get_pos) {
+        fprintf(stderr, "Current x  = %d, y  = %d\n", cur_x, cur_y);
+        fprintf(stdout, "%.1f,%.1f\n", ((double) cur_x) / MAX_PTZ_X * 360.0, ((double) cur_y) / MAX_PTZ_Y * 180.0);
+    }
+    return 0;
+}
+
 void print_usage(char *progname)
 {
     fprintf(stderr, "\nUsage: %s [t ON/OFF] [-s SENS] [-l LED] [-v WHEN] [-i IR] [-r ROTATE] [-1] [-a AIHUMANDETECTION] [-E AIVEHICLEDETECTION] [-N AIANIMALDETECTION] [-O AIMOTIONDETECTION] [-c FACEDETECTION] [-o MOTIONTRACKING] [-I MIC] [-b SOUNDDETECTION] [-B BABYCRYING] [-n SOUNDSENSITIVITY] [-m MOVE] [-g] [-j ABS_POSITION] [-J REL_POSITION] [-p NUM] [-P NAME] [-R NUM] [-C MODE] [-f FILE] [-S TIME] [-T] [-d]\n\n", progname);
@@ -101,6 +137,8 @@ void print_usage(char *progname)
     fprintf(stderr, "\t\tmove PTZ to ABS_POSITION (x,y) in degrees (example -j 500,500)\n");
     fprintf(stderr, "\t-J REL_POSITION, --jump-rel REL_POSITION\n");
     fprintf(stderr, "\t\tmove PTZ to REL_POSITION (x,y) in degrees (example -J 500,500)\n");
+    fprintf(stderr, "\t-K, --calibrate\n");
+    fprintf(stderr, "\t\tfind the PTZ end stops and centre (native pipeline only)\n");
     fprintf(stderr, "\t-p NUM, --preset NUM\n");
     fprintf(stderr, "\t\tsend PTZ go to preset command: TOKEN = [0..7]\n");
     fprintf(stderr, "\t-P NAME, --add_preset NAME\n");
@@ -148,6 +186,7 @@ int main(int argc, char ** argv)
     int soundsensitivity = NONE;
     int move = NONE;
     int get_pos = NONE;
+    int calibrate = NONE;
     int jump_abs = NONE;
     int jump_rel = NONE;
     char jump_msg[24];
@@ -195,6 +234,7 @@ int main(int argc, char ** argv)
             {"get-pos", no_argument, 0, 'g'},
             {"jump-abs", required_argument, 0, 'j'},
             {"jump-rel", required_argument, 0, 'J'},
+            {"calibrate", no_argument, 0, 'K'},
             {"preset",  required_argument, 0, 'p'},
             {"add_preset",  required_argument, 0, 'P'},
             {"set_home_position",  no_argument, 0, 'H'},
@@ -211,7 +251,7 @@ int main(int argc, char ** argv)
         /* getopt_long stores the option index here. */
         int option_index = 0;
 
-        c = getopt_long (argc, argv, "t:s:l:v:i:r:a:E:N:O:c:o:I:b:B:n:m:M:gj:J:p:P:HR:C:f:S:Txdh",
+        c = getopt_long (argc, argv, "t:s:l:v:i:r:a:E:N:O:c:o:I:b:B:n:m:M:gj:J:Kp:P:HR:C:f:S:Txdh",
                          long_options, &option_index);
 
         /* Detect the end of the options. */
@@ -450,6 +490,10 @@ int main(int argc, char ** argv)
             get_pos = 1;
             break;
 
+        case 'K':
+            calibrate = 1;
+            break;
+
         case 'j':
             jump_abs = 1;
             if (sscanf(optarg, "%lf,%lf", &x, &y) != 2) {
@@ -627,8 +671,30 @@ int main(int argc, char ** argv)
         }
     }
 
+    /* Same for the IR illuminator: campipe's day/night keeps it dark at night
+     * while IR_OFF_MARKER exists. */
+    if (ir != NONE) {
+        mkdir(MARKER_DIR, 0755);
+        if (ir == IR_OFF) {
+            int fd = open(IR_OFF_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0)
+                close(fd);
+            else
+                fprintf(stderr, "Can't create %s: %s\n", IR_OFF_MARKER, strerror(errno));
+        } else if (unlink(IR_OFF_MARKER) != 0 && errno != ENOENT) {
+            fprintf(stderr, "Can't remove %s: %s\n", IR_OFF_MARKER, strerror(errno));
+        }
+    }
+
     ret=ipc_start();
     if(ret != 0) {
+        /* No dispatch queue: the native pipeline. PTZ still works by driving the
+         * motor driver directly; everything else needs the stock stack. */
+        if (native_ptz_available() &&
+                (move != NONE || jump_abs != NONE || jump_rel != NONE || get_pos != NONE || calibrate != NONE)) {
+            exit(native_ptz(move, jump_abs != NONE, jump_rel != NONE, x, y, get_pos != NONE, calibrate != NONE) == 0 ?
+                    EXIT_SUCCESS : EXIT_FAILURE);
+        }
         exit(EXIT_FAILURE);
     }
 
