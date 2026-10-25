@@ -56,13 +56,143 @@ void ipc_stop()
     }
 }
 
-/* PTZ without dispatch (native pipeline). Degrees use the same scale as -g. */
-int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get_pos, int calibrate)
+/* PTZ without dispatch (native pipeline). Degrees use the same scale as -g.
+ *
+ * Presets live only in ptz_presets.conf ("N=name,x,y" in degrees), which
+ * ptz_presets.sh already maintains from -g in both modes; dispatch's own copy is
+ * what we lack here, so -P/-R/-H have nothing left to do and -p reads the file.
+ *
+ * Cruise is a small daemon (pid in CRUISE_PID_FILE). Manual moves touch
+ * PTZ_MANUAL_FILE and the daemon pauses until they have been quiet for
+ * CRUISE_RESUME_S, so it does not fight whoever is steering. */
+#define PTZ_PRESETS_FILE "/home/yi-hack/config/ptz_presets.conf"
+#define CRUISE_PID_FILE  "/tmp/ptz_cruise.pid"
+#define PTZ_MANUAL_FILE  "/tmp/ptz_manual"
+#define CRUISE_STAY_S    10
+#define CRUISE_RESUME_S  60
+
+static int native_jump_deg(double x, double y)
+{
+    return native_ptz_jump((int) round(x * MAX_PTZ_X / 360.0), (int) round(y * MAX_PTZ_Y / 180.0));
+}
+
+static int read_preset(int num, double *x, double *y)
+{
+    FILE *f = fopen(PTZ_PRESETS_FILE, "r");
+    char line[128], *p;
+    int n, ret = -1;
+
+    if (f == NULL)
+        return -1;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (sscanf(line, "%d=", &n) != 1 || n != num)
+            continue;
+        p = strchr(line, ',');
+        if (p != NULL && sscanf(p + 1, "%lf,%lf", x, y) == 2)
+            ret = 0;
+        break;
+    }
+    fclose(f);
+    return ret;
+}
+
+static void touch_manual()
+{
+    int fd = open(PTZ_MANUAL_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+        close(fd);
+}
+
+static void cruise_pause(int secs)
+{
+    struct stat st;
+
+    for (; secs > 0; secs--)
+        sleep(1);
+    while (stat(PTZ_MANUAL_FILE, &st) == 0 && time(NULL) - st.st_mtime < CRUISE_RESUME_S)
+        sleep(1);
+}
+
+static void cruise_stop()
+{
+    FILE *f = fopen(CRUISE_PID_FILE, "r");
+    int pid;
+
+    if (f != NULL) {
+        if (fscanf(f, "%d", &pid) == 1 && pid > 1)
+            kill(pid, SIGTERM);
+        fclose(f);
+        unlink(CRUISE_PID_FILE);
+        native_ptz_stop();
+    }
+}
+
+static int cruise_start(int mode)
+{
+    FILE *f;
+    double x, y;
+    int i, found, cur_x, cur_y;
+
+    cruise_stop();
+    if (fork() != 0)
+        return 0;
+    setsid();
+    if (fork() != 0)
+        exit(EXIT_SUCCESS);
+    signal(SIGHUP, SIG_IGN);
+    chdir("/");
+    /* callers (mqtt-config, CGI) may wait for EOF on our stdout */
+    freopen("/dev/null", "r", stdin);
+    freopen("/dev/null", "w", stdout);
+    freopen("/dev/null", "w", stderr);
+
+    f = fopen(CRUISE_PID_FILE, "w");
+    if (f != NULL) {
+        fprintf(f, "%d\n", getpid());
+        fclose(f);
+    }
+
+    while (1) {
+        if (mode == CRUISE_PRESETS) {
+            found = 0;
+            for (i = 0; i < 8; i++) {
+                if (read_preset(i, &x, &y) != 0)
+                    continue;
+                found = 1;
+                cruise_pause(0);
+                native_jump_deg(x, y);
+                cruise_pause(CRUISE_STAY_S);
+            }
+            if (!found)
+                sleep(CRUISE_STAY_S);
+        } else {
+            /* 360: sweep end to end at the current tilt */
+            for (i = 0; i < 2; i++) {
+                cruise_pause(0);
+                if (read_ptz(&cur_x, &cur_y) == 0)
+                    native_ptz_jump(i == 0 ? INT_MAX : 0, cur_y);
+                cruise_pause(CRUISE_STAY_S / 2);
+            }
+        }
+    }
+    return 0;
+}
+
+int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get_pos, int calibrate,
+               int preset, int cruise)
 {
     int cur_x, cur_y;
 
     if (calibrate)
         return native_ptz_calibrate();
+
+    if (cruise == CRUISE_OFF)
+        cruise_stop();
+    else if (cruise == CRUISE_PRESETS || cruise == CRUISE_360 || cruise == CRUISE_ON)
+        return cruise_start(cruise == CRUISE_PRESETS ? CRUISE_PRESETS : CRUISE_360);
+
+    if (move != NONE || jump_abs || jump_rel || preset != NONE)
+        touch_manual();
 
     if (move == MOVE_STOP)
         return native_ptz_stop();
@@ -75,6 +205,14 @@ int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get
     if (move == MOVE_RIGHT)
         return native_ptz_move(NATIVE_RIGHT);
 
+    if (preset != NONE) {
+        if (read_preset(preset, &x, &y) != 0) {
+            fprintf(stderr, "Preset %d not set\n", preset);
+            return -1;
+        }
+        return native_jump_deg(x, y);
+    }
+
     if (jump_abs || jump_rel || get_pos) {
         if (read_ptz(&cur_x, &cur_y) != 0) {
             fprintf(stderr, "Error reading current ptz position\n");
@@ -82,7 +220,7 @@ int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get
         }
     }
     if (jump_abs)
-        return native_ptz_jump((int) round(x * MAX_PTZ_X / 360.0), (int) round(y * MAX_PTZ_Y / 180.0));
+        return native_jump_deg(x, y);
     if (jump_rel)
         return native_ptz_jump(cur_x + (int) round(x * MAX_PTZ_X / 360.0), cur_y + (int) round(y * MAX_PTZ_Y / 180.0));
     if (get_pos) {
@@ -691,9 +829,11 @@ int main(int argc, char ** argv)
         /* No dispatch queue: the native pipeline. PTZ still works by driving the
          * motor driver directly; everything else needs the stock stack. */
         if (native_ptz_available() &&
-                (move != NONE || jump_abs != NONE || jump_rel != NONE || get_pos != NONE || calibrate != NONE)) {
-            exit(native_ptz(move, jump_abs != NONE, jump_rel != NONE, x, y, get_pos != NONE, calibrate != NONE) == 0 ?
-                    EXIT_SUCCESS : EXIT_FAILURE);
+                (move != NONE || jump_abs != NONE || jump_rel != NONE || get_pos != NONE || calibrate != NONE ||
+                 preset != NONE || add_preset != NONE || remove_preset != NONE || set_home_position != NONE ||
+                 cruise != NONE)) {
+            exit(native_ptz(move, jump_abs != NONE, jump_rel != NONE, x, y, get_pos != NONE, calibrate != NONE,
+                            preset, cruise) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
         }
         exit(EXIT_FAILURE);
     }

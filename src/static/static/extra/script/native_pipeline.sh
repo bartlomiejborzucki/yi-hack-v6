@@ -82,8 +82,12 @@ log "modules reloaded (hi3518e count = $(lsmod | grep -c hi3518e))"
 # dispatch queue is missing. Calibration finds the end stops and centres (~10s).
 if [ "$MODEL_SUFFIX" = "h20" ] && [ -f /home/app/localko/ssp_ms41909.ko ] ; then
     [ -e /dev/ssp ] || insmod /home/app/localko/ssp_ms41909.ko >> "$LOG_FILE" 2>&1
-    ( ipc_cmd -K >/dev/null 2>&1 & )
-    log "ptz: motor driver loaded, calibrating"
+    # camera.conf IR/CRUISE were dispatch's to restore at boot; restore them here.
+    CAM_IR=$(sed -n 's/^IR=//p' /home/yi-hack/config/camera.conf)
+    CAM_CRUISE=$(sed -n 's/^CRUISE=//p' /home/yi-hack/config/camera.conf)
+    [ "$CAM_IR" = "no" ] && ipc_cmd -i off >/dev/null 2>&1
+    ( { ipc_cmd -K; [ -n "$CAM_CRUISE" ] && ipc_cmd -C "$CAM_CRUISE"; } >/dev/null 2>&1 & )
+    log "ptz: motor driver loaded, calibrating (cruise=${CAM_CRUISE:-no})"
 fi
 
 # --- 2. campipe env per mode ------------------------------------------------
