@@ -83,6 +83,12 @@
  * mode the same ipc_cmd invocation talks to rmm's message queue instead. */
 #define MIC_MUTE_MARKER IPC_DIR "/mic_off"
 
+/* Day/night (Stage D), same bus. ir_off (`ipc_cmd -i off`, camera.IR=no) keeps the
+ * IR illuminator dark at night; night is written by us while in night mode, so
+ * scripts can read the current state. */
+#define IR_OFF_MARKER   IPC_DIR "/ir_off"
+#define NIGHT_MARKER    IPC_DIR "/night"
+
 /* Audio out (speaker): campipe plays PCM (8kHz/16-bit/mono, signed LE) written to
  * this FIFO through AO. The speaker-amp enable + DAC level are board-specific and
  * come from the per-model audio_hw.conf table via env (CAMPIPE_AMP_ON/_OFF /
@@ -1362,6 +1368,141 @@ static void *ai_thread(void *arg)
     return NULL;
 }
 
+/* ---- day/night (Stage D) -------------------------------------------------
+ *
+ * In stock mode rmm switches day/night; with rmm gone nobody did, so the image
+ * stayed in day mode all night. Enabled by CAMPIPE_DAYNIGHT (auto | day | night).
+ *
+ * Actuation is what rmm does on the h20 (from its disassembly), all through the
+ * stock cpld_periph driver: the IR LEDs are PWM channel 0, ramped 10 -> 50 -> 100
+ * on the way up, and the latching IR-cut is pulsed by the driver itself. The
+ * picture goes greyscale at night via VENC Color2Grey, as in rmm.
+ *
+ * The decision uses the AE's ISO (total gain): night when the sensor is near the
+ * top of its gain for a while, day when it falls well below. The catch is that
+ * our own IR lights the scene, so leaving night can make the image too dark and
+ * send us straight back. Each such short day spell doubles the time ISO must stay
+ * low before we try again (up to an hour); a day that holds resets it. */
+#define CPLD_DEV            "/dev/cpld_periph"
+#define CPLD_PWM0_SET       _IO('p', 19)   /* arg: int* 0..100 - IR illuminator */
+#define CPLD_IRCUT_NIGHT    _IO('p', 21)
+#define CPLD_IRCUT_DAY      _IO('p', 22)
+
+#define DN_TO_NIGHT_S       5      /* ISO above the night threshold this long   */
+#define DN_TO_DAY_S         10     /* ISO below the day threshold this long     */
+#define DN_TO_DAY_MAX_S     3600
+#define DN_SHORT_DAY_S      120    /* a day shorter than this was a false exit  */
+
+static int env_int(const char *name, int def)
+{
+    const char *e = getenv(name);
+    return (e && *e) ? atoi(e) : def;
+}
+
+static void dn_apply(int night, int ir_on)
+{
+    VENC_COLOR2GREY_S grey;
+    int fd, pwm, chn;
+    static const int ramp[] = { 10, 50, 100 };
+
+    fd = open(CPLD_DEV, O_RDWR);
+    if (fd < 0) {
+        SAMPLE_PRT("daynight: open %s failed: %s\n", CPLD_DEV, strerror(errno));
+    } else if (night) {
+        if (ir_on) {
+            for (chn = 0; chn < 3; chn++) {
+                pwm = ramp[chn] * env_int("CAMPIPE_IR_PWM", 100) / 100;
+                ioctl(fd, CPLD_PWM0_SET, &pwm);
+                usleep(200 * 1000);
+            }
+        } else {
+            pwm = 0;
+            ioctl(fd, CPLD_PWM0_SET, &pwm);
+        }
+        ioctl(fd, CPLD_IRCUT_NIGHT);
+    } else {
+        pwm = 0;
+        ioctl(fd, CPLD_PWM0_SET, &pwm);
+        ioctl(fd, CPLD_IRCUT_DAY);
+    }
+    if (fd >= 0)
+        close(fd);
+
+    grey.bColor2Grey = night ? HI_TRUE : HI_FALSE;
+    for (chn = 0; chn <= VENC_JPEG_LOW; chn++)
+        HI_MPI_VENC_SetColor2Grey(chn, &grey);
+
+    if (night) {
+        FILE *fp = fopen(NIGHT_MARKER, "w");
+        if (fp)
+            fclose(fp);
+    } else {
+        remove(NIGHT_MARKER);
+    }
+}
+
+static void *daynight_thread(void *arg)
+{
+    const char *mode = (const char *) arg;
+    int iso_night = env_int("CAMPIPE_ISO_NIGHT", 6000);
+    int iso_day   = env_int("CAMPIPE_ISO_DAY", 1200);
+    int debug     = env_int("CAMPIPE_DN_DEBUG", 0);   /* log AE every N seconds */
+    unsigned int tick = 0;
+    int night = -1, ir_on = -1, want, want_ir;
+    int above = 0, below = 0, to_day = DN_TO_DAY_S;
+    time_t day_since = 0, now;
+    ISP_EXP_INFO_S ei;
+
+    memset(&ei, 0, sizeof(ei));
+    SAMPLE_PRT("daynight: mode %s, ISO night >= %d, day <= %d\n", mode, iso_night, iso_day);
+    mkdir(IPC_DIR, 0755);
+
+    while (!g_stop) {
+        want_ir = (access(IR_OFF_MARKER, F_OK) != 0);
+        want = night;
+
+        if (strcmp(mode, "night") == 0) {
+            want = 1;
+        } else if (strcmp(mode, "day") == 0) {
+            want = 0;
+        } else if (HI_MPI_ISP_QueryExposureInfo(0, &ei) == HI_SUCCESS) {
+            if (debug > 0 && ++tick % debug == 0)
+                SAMPLE_PRT("daynight: iso %u ei %u max %d lum %u\n", ei.u32ISO,
+                           ei.u32Exposure, ei.bExposureIsMAX, ei.u8AveLum);
+            above = ((int) ei.u32ISO >= iso_night) ? above + 1 : 0;
+            below = ((int) ei.u32ISO <= iso_day) ? below + 1 : 0;
+            if (night < 0)
+                want = (above > 0);         /* first sample: no history yet */
+            else if (night == 0 && above >= DN_TO_NIGHT_S)
+                want = 1;
+            else if (night == 1 && below >= to_day)
+                want = 0;
+        }
+
+        if (want != night || (want == 1 && want_ir != ir_on)) {
+            now = time(NULL);
+            if (night == 0 && want == 1 && day_since) {
+                /* a day that did not last was our own IR leaving the scene dark */
+                if (now - day_since < DN_SHORT_DAY_S)
+                    to_day = (to_day * 2 > DN_TO_DAY_MAX_S) ? DN_TO_DAY_MAX_S : to_day * 2;
+                else
+                    to_day = DN_TO_DAY_S;
+            }
+            if (want == 0)
+                day_since = now;
+            if (want != night)
+                SAMPLE_PRT("daynight: -> %s (ISO %u, next day after %ds)\n",
+                           want ? "NIGHT" : "DAY", ei.u32ISO, to_day);
+            dn_apply(want, want_ir);
+            night = want;
+            ir_on = want_ir;
+            above = below = 0;
+        }
+        sleep(1);
+    }
+    return NULL;
+}
+
 int main(void)
 {
     VB_CONF_S vb;
@@ -1372,7 +1513,9 @@ int main(void)
     SIZE_S sensor_sz;
     PIC_SIZE_E sensor_pic;
     HI_S32 ret;
-    pthread_t th_high, th_low, th_md, th_ao, th_ai;
+    pthread_t th_high, th_low, th_md, th_ao, th_ai, th_dn;
+    const char *dn_mode = getenv("CAMPIPE_DAYNIGHT");
+    int dn_on = dn_mode && (!strcmp(dn_mode, "auto") || !strcmp(dn_mode, "day") || !strcmp(dn_mode, "night"));
     stream_ctx_t ctx_high = { CHN_HIGH, FIFO_HIGH, 512 * 1024 };
     stream_ctx_t ctx_low  = { CHN_LOW,  FIFO_LOW,  128 * 1024 };
     struct { VPSS_CHN chn; HI_U32 w, h; COMPRESS_MODE_E cmp; } vchn[] = {
@@ -1591,6 +1734,8 @@ int main(void)
         pthread_create(&th_ao, NULL, ao_thread, NULL);
     if (ai_on)
         pthread_create(&th_ai, NULL, ai_thread, &ai_cfg);
+    if (dn_on)
+        pthread_create(&th_dn, NULL, daynight_thread, (void *) dn_mode);
 
     SAMPLE_PRT("campipe: native pipeline running (high+low H.264, JPEG snap idle%s%s%s)\n",
                md_on ? ", motion detection on" : "", ao_on ? ", audio out on" : "",
@@ -1607,6 +1752,8 @@ int main(void)
         pthread_join(th_ao, NULL);
     if (ai_on)
         pthread_join(th_ai, NULL);
+    if (dn_on)
+        pthread_join(th_dn, NULL);
 
     /* Best-effort teardown; on a clean stop the startup script also re-inits. */
     HI_MPI_VENC_StopRecvPic(CHN_HIGH);

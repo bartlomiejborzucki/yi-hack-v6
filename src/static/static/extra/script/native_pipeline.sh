@@ -77,6 +77,15 @@ log "reloading SDK modules ($MODE) from $KO_RUN ..."
 himm 0x2003002c 0x1c4001 >/dev/null 2>&1
 log "modules reloaded (hi3518e count = $(lsmod | grep -c hi3518e))"
 
+# h20 (Yi Dome) PTZ: the stock dispatch that owns the motors does not run here, so
+# load its motor driver ourselves; ipc_cmd drives /dev/ssp directly when the
+# dispatch queue is missing. Calibration finds the end stops and centres (~10s).
+if [ "$MODEL_SUFFIX" = "h20" ] && [ -f /home/app/localko/ssp_ms41909.ko ] ; then
+    [ -e /dev/ssp ] || insmod /home/app/localko/ssp_ms41909.ko >> "$LOG_FILE" 2>&1
+    ( ipc_cmd -K >/dev/null 2>&1 & )
+    log "ptz: motor driver loaded, calibrating"
+fi
+
 # --- 2. campipe env per mode ------------------------------------------------
 # VB pool depth: offline needs 5 (VI->DDR->VPSS round-trip + LDC), online 3.
 # LDC only meaningful offline; validated ranges baked into campipe defaults.
@@ -96,6 +105,8 @@ fi
 # overrides; the low JPEG default (w*h*2) is already large enough.
 if [ "$MODEL_SUFFIX" = "h20" ] ; then
     export CAMPIPE_H264HI_KB=2025 CAMPIPE_H264LO_KB=225 CAMPIPE_JPEGHI_KB=2048
+    # Day/night: rmm drove the IR-cut and the IR LEDs here; campipe does now.
+    export CAMPIPE_DAYNIGHT=auto
 fi
 
 # --- 3. rRTSPServer params ---------------------------------------------------
