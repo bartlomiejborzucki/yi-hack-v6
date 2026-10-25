@@ -295,7 +295,18 @@ fi
 # say so rather than leaving a silently adopted module behind.
 # The device node is the module's own (misc_register), so testing it with a
 # builtin says whether the module is loaded without forking lsmod+grep.
-if [ "$NATIVE_PIPELINE" = "no" ] && [ -c /dev/cpld_periph ] ; then
+#
+# NOT on the PTZ domes: their cpld_periph also runs the pan/tilt motor timer and does
+# not free IRQ 31 on exit. After rmmod + stock re-insmod, dmesg shows
+# "request_irq 31 failed!" and the next timer tick lands in the unloaded module:
+# the h20 hard-resets ~21 s into every boot. The domes run the non-v3 module (the one
+# system_init.sh loads, confirmed by lsmod on a stock-booted h20), so leaving it for
+# stock to adopt is safe.
+case "$MODEL_SUFFIX" in
+    h20|y19|v201|yi_dome|yi_dome_1080p|yi_cloud_dome_1080p) CPLD_HANDOFF=no ;;
+    *) CPLD_HANDOFF=yes ;;
+esac
+if [ "$NATIVE_PIPELINE" = "no" ] && [ "$CPLD_HANDOFF" = "yes" ] && [ -c /dev/cpld_periph ] ; then
     rmmod cpld_periph || echo "system.sh: rmmod cpld_periph failed - rmm will inherit the module we loaded"
 fi
 
