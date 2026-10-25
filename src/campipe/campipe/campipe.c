@@ -185,6 +185,95 @@ int sensor_unregister_callback(void)
     return g_sns_unreg ? g_sns_unreg() : HI_SUCCESS;
 }
 
+/* ---- sensor plugin AE ABI shim --------------------------------------------
+ *
+ * The stock plugin is built against MPP 1.0.4.0, whose AE_SENSOR_DEFAULT_S has
+ * one more u32 at offset 28 (before u32FullLinesStd) than the public 1.0.3.0
+ * headers we may be built with; every later field sits 4 bytes further on
+ * (checked against each store in the plugin's cmos_get_ae_default). Read
+ * through the 1.0.3 layout, the AE saw garbage limits - analog gain pinned at
+ * 1x, all the gain pushed into ISP digital gain - hence a dark, noisy picture
+ * and an ISO stuck at its maximum.
+ *
+ * The plugin hands its callbacks to HI_MPI_AE_SensorRegCallBack; the Makefile
+ * renames the SDK's copy to hiae_SensorRegCallBack so this one is what the
+ * plugin binds to. When the linked MPP is 1.0.3, the three callbacks that take
+ * the struct run on a 1.0.4-shaped copy and are converted both ways. */
+#define AE_DFT_GAP_OFF  28
+#define AE_DFT_GAP_LEN  4
+
+extern HI_S32 hiae_SensorRegCallBack(ISP_DEV IspDev, ALG_LIB_S *pstAeLib, SENSOR_ID SensorId,
+                                     AE_SENSOR_REGISTER_S *pstRegister);
+
+static HI_S32 (*g_ae_get_default)(AE_SENSOR_DEFAULT_S *);
+static HI_VOID (*g_ae_fps_set)(HI_FLOAT, AE_SENSOR_DEFAULT_S *);
+static HI_VOID (*g_ae_slow_fr_set)(HI_U32, AE_SENSOR_DEFAULT_S *);
+/* Persistent 1.0.4 copy: it keeps the extra field the plugin may rely on. */
+static HI_U8 g_ae_dft104[sizeof(AE_SENSOR_DEFAULT_S) + AE_DFT_GAP_LEN];
+
+static void ae_dft_to104(const AE_SENSOR_DEFAULT_S *src)
+{
+    memcpy(g_ae_dft104, src, AE_DFT_GAP_OFF);
+    memcpy(g_ae_dft104 + AE_DFT_GAP_OFF + AE_DFT_GAP_LEN, (const HI_U8 *) src + AE_DFT_GAP_OFF,
+           sizeof(AE_SENSOR_DEFAULT_S) - AE_DFT_GAP_OFF);
+}
+
+static void ae_dft_to103(AE_SENSOR_DEFAULT_S *dst)
+{
+    memcpy(dst, g_ae_dft104, AE_DFT_GAP_OFF);
+    memcpy((HI_U8 *) dst + AE_DFT_GAP_OFF, g_ae_dft104 + AE_DFT_GAP_OFF + AE_DFT_GAP_LEN,
+           sizeof(AE_SENSOR_DEFAULT_S) - AE_DFT_GAP_OFF);
+}
+
+static HI_S32 ae_get_default_shim(AE_SENSOR_DEFAULT_S *dft)
+{
+    HI_S32 ret;
+
+    memset(g_ae_dft104, 0, sizeof(g_ae_dft104));
+    ret = g_ae_get_default((AE_SENSOR_DEFAULT_S *) g_ae_dft104);
+    ae_dft_to103(dft);
+    SAMPLE_PRT("AE sensor defaults (1.0.4 -> 1.0.3): lines %u, inttime [%u, %u], again [%u, %u], "
+               "ispdgain [%u, %u] >> %u\n", dft->u32FullLinesStd, dft->u32MinIntTime, dft->u32MaxIntTime,
+               dft->u32MinAgain, dft->u32MaxAgain, dft->u32MinISPDgainTarget, dft->u32MaxISPDgainTarget,
+               dft->u32ISPDgainShift);
+    return ret;
+}
+
+static HI_VOID ae_fps_set_shim(HI_FLOAT fps, AE_SENSOR_DEFAULT_S *dft)
+{
+    ae_dft_to104(dft);
+    g_ae_fps_set(fps, (AE_SENSOR_DEFAULT_S *) g_ae_dft104);
+    ae_dft_to103(dft);
+}
+
+static HI_VOID ae_slow_fr_set_shim(HI_U32 full_lines, AE_SENSOR_DEFAULT_S *dft)
+{
+    ae_dft_to104(dft);
+    g_ae_slow_fr_set(full_lines, (AE_SENSOR_DEFAULT_S *) g_ae_dft104);
+    ae_dft_to103(dft);
+}
+
+HI_S32 HI_MPI_AE_SensorRegCallBack(ISP_DEV IspDev, ALG_LIB_S *pstAeLib, SENSOR_ID SensorId,
+                                   AE_SENSOR_REGISTER_S *pstRegister)
+{
+    MPP_VERSION_S ver;
+    AE_SENSOR_EXP_FUNC_S *f = &pstRegister->stSnsExp;
+
+    if (HI_MPI_SYS_GetVersion(&ver) == HI_SUCCESS && strstr(ver.aVersion, "V1.0.3.") != NULL) {
+        SAMPLE_PRT("MPP %s: adapting the sensor plugin's 1.0.4 AE defaults\n", ver.aVersion);
+        g_ae_get_default = f->pfn_cmos_get_ae_default;
+        g_ae_fps_set = f->pfn_cmos_fps_set;
+        g_ae_slow_fr_set = f->pfn_cmos_slow_framerate_set;
+        if (g_ae_get_default)
+            f->pfn_cmos_get_ae_default = ae_get_default_shim;
+        if (g_ae_fps_set)
+            f->pfn_cmos_fps_set = ae_fps_set_shim;
+        if (g_ae_slow_fr_set)
+            f->pfn_cmos_slow_framerate_set = ae_slow_fr_set_shim;
+    }
+    return hiae_SensorRegCallBack(IspDev, pstAeLib, SensorId, pstRegister);
+}
+
 /* ISP bring-up for the F22: same call sequence as SAMPLE_COMM_ISP_Init /
  * stock rmm, but with the F22's real geometry (the sample's per-sensor pub
  * attr table has no F22 entry). */
@@ -243,6 +332,43 @@ static HI_S32 f22_isp_init(void)
     return HI_SUCCESS;
 }
 
+/* AE limits. The F22 plugin is the stock one, built against the 1.0.4.0 SDK;
+ * logged here so the ranges the AE actually runs with are visible, with env
+ * overrides (CAMPIPE_AE_<FIELD>_MAX) for the ones the plugin gets wrong. */
+static void ae_range(const char *name, ISP_AE_RANGE_S *r)
+{
+    char env[48];
+    const char *e;
+
+    snprintf(env, sizeof(env), "CAMPIPE_AE_%s_MAX", name);
+    e = getenv(env);
+    SAMPLE_PRT("AE %s range [%u, %u]%s%s\n", name, r->u32Min, r->u32Max,
+               (e && *e) ? " -> max " : "", (e && *e) ? e : "");
+    if (e && *e)
+        r->u32Max = strtoul(e, NULL, 0);
+}
+
+static void ae_tune(void)
+{
+    ISP_EXPOSURE_ATTR_S ea;
+    HI_S32 ret;
+
+    if ((ret = HI_MPI_ISP_GetExposureAttr(0, &ea)) != HI_SUCCESS) {
+        SAMPLE_PRT("ISP_GetExposureAttr failed %#x\n", ret);
+        return;
+    }
+    ae_range("EXPTIME", &ea.stAuto.stExpTimeRange);
+    ae_range("AGAIN", &ea.stAuto.stAGainRange);
+    ae_range("DGAIN", &ea.stAuto.stDGainRange);
+    ae_range("ISPDGAIN", &ea.stAuto.stISPDGainRange);
+    ae_range("SYSGAIN", &ea.stAuto.stSysGainRange);
+    SAMPLE_PRT("AE gain threshold %u, mode %d, compensation %u, antiflicker %d\n",
+               ea.stAuto.u32GainThreshold, ea.stAuto.enAEMode, ea.stAuto.u8Compensation,
+               ea.stAuto.stAntiflicker.bEnable);
+    if ((ret = HI_MPI_ISP_SetExposureAttr(0, &ea)) != HI_SUCCESS)
+        SAMPLE_PRT("ISP_SetExposureAttr failed %#x\n", ret);
+}
+
 /* VI+ISP start for the F22 (replaces SAMPLE_COMM_VI_StartVi, whose per-sensor
  * tables are all wrong-sized for it). Same step order as the sample:
  * MIPI/CMOS attr -> ISP init -> ISP run thread -> VI dev -> VI chn. The dev
@@ -267,6 +393,7 @@ static HI_S32 f22_start_vi_isp(SAMPLE_VI_CONFIG_S *vi)
         SAMPLE_PRT("ISP_Run failed %#x\n", ret);
         return ret;
     }
+    ae_tune();
 
     memcpy(&dev, &DEV_ATTR_OV9732_DC_720P_BASE, sizeof(dev));
     dev.stDevRect = cap;
@@ -1467,8 +1594,9 @@ static void *daynight_thread(void *arg)
             want = 0;
         } else if (HI_MPI_ISP_QueryExposureInfo(0, &ei) == HI_SUCCESS) {
             if (debug > 0 && ++tick % debug == 0)
-                SAMPLE_PRT("daynight: iso %u ei %u max %d lum %u\n", ei.u32ISO,
-                           ei.u32Exposure, ei.bExposureIsMAX, ei.u8AveLum);
+                SAMPLE_PRT("daynight: iso %u exp %u (t %u ag %u dg %u ispdg %u) max %d lum %u fps %u\n",
+                           ei.u32ISO, ei.u32Exposure, ei.u32ExpTime, ei.u32AGain, ei.u32DGain,
+                           ei.u32ISPDGain, ei.bExposureIsMAX, ei.u8AveLum, ei.u32Fps);
             above = ((int) ei.u32ISO >= iso_night) ? above + 1 : 0;
             below = ((int) ei.u32ISO <= iso_day) ? below + 1 : 0;
             if (night < 0)
