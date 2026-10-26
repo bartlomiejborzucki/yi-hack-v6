@@ -58,3 +58,11 @@ the stock stack whatever the setting says.
 - With the native pipeline the Yi app, the cloud and Xiaomi's AI detection
   (people, faces) are off. The camera's processor is too weak to replace the AI
   detection.
+
+## Not done yet
+
+- **Announcements from Home Assistant**: the speaker plays anything written to
+  `/tmp/audio_out_fifo` (8 kHz, 16-bit mono PCM). Missing: a CGI that plays a
+  sound file or URL, and a Home Assistant script that sends it TTS or a chime.
+- **Sound from the web UI**: upload a sound file and play it on the camera. A
+  live microphone in the browser needs HTTPS, which the web UI does not have.
