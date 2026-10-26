@@ -130,6 +130,15 @@ RRTSP_USER=""; RRTSP_PWD=""
 [ -n "$PASSWORD" ] && RRTSP_PWD="-w $PASSWORD"
 RTSP_ENABLED=$ENABLED
 
+# STREAM=high: nobody reads the 640x360 stream, so campipe does not encode it,
+# and its MMZ (~2.7MB) buys a 4th 1080p VB block - with only 3 the 1080p
+# channel drops to ~17fps of the sensor's 25. Offline mode keeps its own depth.
+C_LOW=on
+if [ "$STREAM" = "high" ] ; then
+    C_LOW=off
+    [ "$MODE" = "offline" ] || C_VBLK=4
+fi
+
 # Forward audio (mic -> AAC): campipe captures AI, encodes AAC-LC and writes ADTS
 # frames to /tmp/aac_audio_fifo, which is the FIFO rRTSPServer's audio track reads.
 # AUDIO_QUALITY picks the mic sample rate - note this is the WHOLE inner codec's
@@ -258,7 +267,7 @@ while : ; do
         CAMPIPE_VBLK=$C_VBLK CAMPIPE_LDC=$C_LDC CAMPIPE_MD=$C_MD CAMPIPE_MD_SENS=$C_MD_SENS \
             CAMPIPE_AMP_ON="$AMP_ON" CAMPIPE_AMP_OFF="$AMP_OFF" CAMPIPE_DAC_VOL="$DAC_VOL" \
             CAMPIPE_AUDIO="$C_AUDIO" CAMPIPE_AUDIO_RATE="$C_AUDIO_RATE" \
-            CAMPIPE_AUDIO_NR="$C_AUDIO_NR" \
+            CAMPIPE_AUDIO_NR="$C_AUDIO_NR" CAMPIPE_LOW="$C_LOW" \
             "$CAMPIPE" >> "$LOG_FILE" 2>&1 &
         sleep 3
     fi

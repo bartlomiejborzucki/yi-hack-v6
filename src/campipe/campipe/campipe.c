@@ -1644,6 +1644,11 @@ int main(void)
     pthread_t th_high, th_low, th_md, th_ao, th_ai, th_dn;
     const char *dn_mode = getenv("CAMPIPE_DAYNIGHT");
     int dn_on = dn_mode && (!strcmp(dn_mode, "auto") || !strcmp(dn_mode, "day") || !strcmp(dn_mode, "night"));
+    /* The 640x360 stream is opt-out via CAMPIPE_LOW=off (rtsp STREAM=high): its
+     * VB pool and encoder buffers are ~2.7MB of MMZ, which the boot script can
+     * then spend on a 4th 1080p block instead. */
+    const char *low_env = getenv("CAMPIPE_LOW");
+    int low_on = !(low_env && (!strcmp(low_env, "off") || !strcmp(low_env, "no")));
     stream_ctx_t ctx_high = { CHN_HIGH, FIFO_HIGH, 512 * 1024 };
     stream_ctx_t ctx_low  = { CHN_LOW,  FIFO_LOW,  128 * 1024 };
     struct { VPSS_CHN chn; HI_U32 w, h; COMPRESS_MODE_E cmp; } vchn[] = {
@@ -1747,6 +1752,11 @@ int main(void)
      * from this pool. MD holds two frames at once (cur+ref) plus user-get depth,
      * so give it extra blocks when enabled. */
     vb.astCommPool[2].u32BlkCnt = md_on ? 8 : 4;
+    if (!low_on) {
+        /* no 640x360 pool: close the gap rather than leave an empty one */
+        vb.astCommPool[1] = vb.astCommPool[2];
+        memset(&vb.astCommPool[2], 0, sizeof(vb.astCommPool[2]));
+    }
 
     if ((ret = SAMPLE_COMM_SYS_Init(&vb)) != HI_SUCCESS) {
         SAMPLE_PRT("SYS_Init failed %#x\n", ret);
@@ -1781,6 +1791,8 @@ int main(void)
         goto err_vpss;
     }
     for (i = 0; i < 3; i++) {
+        if (vchn[i].chn == CHN_LOW && !low_on)
+            continue;
         memset(&chn_mode, 0, sizeof(chn_mode));
         chn_mode.enChnMode      = VPSS_CHN_MODE_USER;
         chn_mode.bDouble        = HI_FALSE;
@@ -1827,7 +1839,7 @@ int main(void)
     /* --- VENC: two H.264 streams + two idle JPEG snap channels --- */
     if (start_h264(CHN_HIGH, CHN_HIGH, W_HIGH, H_HIGH, 2048, SNS_FPS) != HI_SUCCESS)
         goto err_vpss;
-    if (start_h264(CHN_LOW, CHN_LOW, W_LOW, H_LOW, 512, SNS_FPS) != HI_SUCCESS)
+    if (low_on && start_h264(CHN_LOW, CHN_LOW, W_LOW, H_LOW, 512, SNS_FPS) != HI_SUCCESS)
         goto err_vpss;
     if (start_jpeg(VENC_JPEG_HIGH, CHN_HIGH, W_HIGH, H_HIGH) != HI_SUCCESS)
         goto err_vpss;
@@ -1855,7 +1867,8 @@ int main(void)
     }
 
     pthread_create(&th_high, NULL, stream_thread, &ctx_high);
-    pthread_create(&th_low, NULL, stream_thread, &ctx_low);
+    if (low_on)
+        pthread_create(&th_low, NULL, stream_thread, &ctx_low);
     if (md_on)
         pthread_create(&th_md, NULL, md_thread, &md_sens);
     if (ao_on)
@@ -1865,7 +1878,8 @@ int main(void)
     if (dn_on)
         pthread_create(&th_dn, NULL, daynight_thread, (void *) dn_mode);
 
-    SAMPLE_PRT("campipe: native pipeline running (high+low H.264, JPEG snap idle%s%s%s)\n",
+    SAMPLE_PRT("campipe: native pipeline running (%s H.264, JPEG snap idle%s%s%s)\n",
+               low_on ? "high+low" : "high only",
                md_on ? ", motion detection on" : "", ao_on ? ", audio out on" : "",
                ai_on ? ", audio in on" : "");
 
@@ -1873,7 +1887,8 @@ int main(void)
         pause();
 
     pthread_join(th_high, NULL);
-    pthread_join(th_low, NULL);
+    if (low_on)
+        pthread_join(th_low, NULL);
     if (md_on)
         pthread_join(th_md, NULL);
     if (ao_on)
@@ -1885,7 +1900,8 @@ int main(void)
 
     /* Best-effort teardown; on a clean stop the startup script also re-inits. */
     HI_MPI_VENC_StopRecvPic(CHN_HIGH);
-    HI_MPI_VENC_StopRecvPic(CHN_LOW);
+    if (low_on)
+        HI_MPI_VENC_StopRecvPic(CHN_LOW);
 err_vpss:
     SAMPLE_COMM_VPSS_Stop(1, md_on ? 4 : 3);
 err_vi:
