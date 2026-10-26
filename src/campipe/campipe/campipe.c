@@ -87,6 +87,15 @@
  * IR illuminator dark at night; night is written by us while in night mode, so
  * scripts can read the current state. */
 #define IR_OFF_MARKER   IPC_DIR "/ir_off"
+
+/* Motion tracking (PTZ), same bus. While motion is seen, the detector keeps
+ * MOTION_XY_FILE at "<seq> <x> <y>": the area-weighted centre of the moving
+ * regions in permille of the frame, seq bumping on every update. The tracker
+ * (`ipc_cmd -o on`) creates PTZ_MOVING_MARKER while the camera turns; the
+ * detector skips those frames and re-seeds its reference afterwards, or the
+ * turn itself would read as motion. */
+#define MOTION_XY_FILE    IPC_DIR "/motion_xy"
+#define PTZ_MOVING_MARKER IPC_DIR "/ptz_moving"
 #define NIGHT_MARKER    IPC_DIR "/night"
 
 /* Audio out (speaker): campipe plays PCM (8kHz/16-bit/mono, signed LE) written to
@@ -697,6 +706,7 @@ static void *md_thread(void *arg)
     HI_VOID *sad_vir = NULL, *blob_vir = NULL;
     VIDEO_FRAME_INFO_S prev, cur;
     int have_prev = 0, motion = 0, on_ticks = 0;
+    unsigned int xy_seq = 0;
     time_t last_move = 0;
     HI_U32 sad_stride = (W_MD + 15) & ~15u;    /* IVE wants a 16-aligned stride */
     HI_S32 ret;
@@ -764,6 +774,15 @@ static void *md_thread(void *arg)
 
         if (HI_MPI_VPSS_GetChnFrame(VPSS_GRP, VPSS_CHN_MD, &cur, 200) != HI_SUCCESS)
             continue;
+        if (access(PTZ_MOVING_MARKER, F_OK) == 0) {
+            /* the camera is turning: drop the reference, keep the motion state */
+            HI_MPI_VPSS_ReleaseChnFrame(VPSS_GRP, VPSS_CHN_MD, &cur);
+            if (have_prev)
+                HI_MPI_VPSS_ReleaseChnFrame(VPSS_GRP, VPSS_CHN_MD, &prev);
+            have_prev = 0;
+            last_move = time(NULL);
+            continue;
+        }
         if (!have_prev) {          /* seed the reference on the first frame */
             prev = cur;
             have_prev = 1;
@@ -776,11 +795,30 @@ static void *md_thread(void *arg)
 
         moved = 0;
         if (ret == HI_SUCCESS) {
+            HI_U64 sx = 0, sy = 0;
+
             cc = (IVE_CCBLOB_S *)blob_vir;
-            for (i = 0; i < cc->u8RegionNum; i++)
-                area += cc->astRegion[i].u32Area;
-            if (cc->u8RegionNum > 0 && (int)area >= sens.min_area)
+            /* regions are stored non-contiguously: skip the empty slots */
+            for (i = 0; i < IVE_MAX_REGION_NUM; i++) {
+                IVE_REGION_S *r = &cc->astRegion[i];
+                if (r->u32Area == 0)
+                    continue;
+                area += r->u32Area;
+                sx += (HI_U64) r->u32Area * (r->u16Left + r->u16Right);
+                sy += (HI_U64) r->u32Area * (r->u16Top + r->u16Bottom);
+            }
+            if (cc->u8RegionNum > 0 && (int)area >= sens.min_area) {
+                /* region borders are in MD-frame pixels (W_MD x H_MD) */
+                FILE *fp = fopen(MOTION_XY_FILE ".tmp", "w");
                 moved = 1;
+                if (fp) {
+                    fprintf(fp, "%u %u %u\n", ++xy_seq,
+                            (unsigned) (sx * 1000 / (2 * area * W_MD)),
+                            (unsigned) (sy * 1000 / (2 * area * H_MD)));
+                    fclose(fp);
+                    rename(MOTION_XY_FILE ".tmp", MOTION_XY_FILE);
+                }
+            }
         }
 
         /* debounce -> edges */

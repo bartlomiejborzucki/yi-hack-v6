@@ -85,9 +85,11 @@ if [ "$MODEL_SUFFIX" = "h20" ] && [ -f /home/app/localko/ssp_ms41909.ko ] ; then
     # camera.conf IR/CRUISE were dispatch's to restore at boot; restore them here.
     CAM_IR=$(sed -n 's/^IR=//p' /home/yi-hack/config/camera.conf)
     CAM_CRUISE=$(sed -n 's/^CRUISE=//p' /home/yi-hack/config/camera.conf)
+    CAM_TRACK=$(sed -n 's/^MOTION_TRACKING=//p' /home/yi-hack/config/camera.conf)
     [ "$CAM_IR" = "no" ] && ipc_cmd -i off >/dev/null 2>&1
-    ( { ipc_cmd -K; [ -n "$CAM_CRUISE" ] && ipc_cmd -C "$CAM_CRUISE"; } >/dev/null 2>&1 & )
-    log "ptz: motor driver loaded, calibrating (cruise=${CAM_CRUISE:-no})"
+    ( { ipc_cmd -K; [ -n "$CAM_CRUISE" ] && ipc_cmd -C "$CAM_CRUISE"
+        [ "$CAM_TRACK" = "yes" ] && ipc_cmd -o on; } >/dev/null 2>&1 & )
+    log "ptz: motor driver loaded, calibrating (cruise=${CAM_CRUISE:-no} tracking=${CAM_TRACK:-no})"
 fi
 
 # --- 2. campipe env per mode ------------------------------------------------

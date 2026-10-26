@@ -113,27 +113,26 @@ static void cruise_pause(int secs)
         sleep(1);
 }
 
-static void cruise_stop()
+/* Stop the daemon whose pid is in pid_file; returns 1 if there was one. */
+static int daemon_stop(const char *pid_file)
 {
-    FILE *f = fopen(CRUISE_PID_FILE, "r");
+    FILE *f = fopen(pid_file, "r");
     int pid;
 
-    if (f != NULL) {
-        if (fscanf(f, "%d", &pid) == 1 && pid > 1)
-            kill(pid, SIGTERM);
-        fclose(f);
-        unlink(CRUISE_PID_FILE);
-        native_ptz_stop();
-    }
+    if (f == NULL)
+        return 0;
+    if (fscanf(f, "%d", &pid) == 1 && pid > 1)
+        kill(pid, SIGTERM);
+    fclose(f);
+    unlink(pid_file);
+    return 1;
 }
 
-static int cruise_start(int mode)
+/* Returns in the parent (0) and in the detached child (1), which owns pid_file. */
+static int daemon_start(const char *pid_file)
 {
     FILE *f;
-    double x, y;
-    int i, found, cur_x, cur_y;
 
-    cruise_stop();
     if (fork() != 0)
         return 0;
     setsid();
@@ -146,11 +145,28 @@ static int cruise_start(int mode)
     freopen("/dev/null", "w", stdout);
     freopen("/dev/null", "w", stderr);
 
-    f = fopen(CRUISE_PID_FILE, "w");
+    f = fopen(pid_file, "w");
     if (f != NULL) {
         fprintf(f, "%d\n", getpid());
         fclose(f);
     }
+    return 1;
+}
+
+static void cruise_stop()
+{
+    if (daemon_stop(CRUISE_PID_FILE))
+        native_ptz_stop();
+}
+
+static int cruise_start(int mode)
+{
+    double x, y;
+    int i, found, cur_x, cur_y;
+
+    cruise_stop();
+    if (!daemon_start(CRUISE_PID_FILE))
+        return 0;
 
     while (1) {
         if (mode == CRUISE_PRESETS) {
@@ -178,8 +194,154 @@ static int cruise_start(int mode)
     return 0;
 }
 
+/* Native settings persistence. In stock mode mqttv4 sees each command on
+ * dispatch's queue, records it in camera.conf and publishes the new state; with
+ * no queue that never happens, so the HA switches snapped back and boot could not
+ * restore the setting. Do both here for the settings handled natively. */
+#define CAMERA_CONF_FILE "/home/yi-hack/config/camera.conf"
+#define CONF2MQTT_SCRIPT "/home/yi-hack/extra/script/conf2mqtt.sh"
+
+static int camera_conf_set(const char *key, const char *value)
+{
+    char line[256], tmp[] = CAMERA_CONF_FILE ".tmp";
+    FILE *in, *out;
+    size_t klen = strlen(key);
+    int changed = 0;
+
+    in = fopen(CAMERA_CONF_FILE, "r");
+    if (in == NULL)
+        return 0;
+    out = fopen(tmp, "w");
+    if (out == NULL) {
+        fclose(in);
+        return 0;
+    }
+    while (fgets(line, sizeof(line), in) != NULL) {
+        if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strcmp(line + klen + 1, value) != 0)
+                changed = 1;
+            fprintf(out, "%s=%s\n", key, value);
+        } else {
+            fputs(line, out);
+        }
+    }
+    fclose(in);
+    fclose(out);
+    /* rewrite the flash only on a real change */
+    if (changed)
+        rename(tmp, CAMERA_CONF_FILE);
+    else
+        unlink(tmp);
+    return changed;
+}
+
+static void native_persist(int ir, int mic, int cruise, int tracking)
+{
+    int changed = 0;
+
+    if (ir != NONE)
+        changed |= camera_conf_set("IR", ir == IR_ON ? "yes" : "no");
+    if (mic != NONE)
+        changed |= camera_conf_set("MIC", mic == MIC_ON ? "yes" : "no");
+    if (cruise != NONE)
+        changed |= camera_conf_set("CRUISE", cruise == CRUISE_PRESETS ? "presets" :
+                                   (cruise == CRUISE_OFF ? "no" : "360"));
+    if (tracking != NONE)
+        changed |= camera_conf_set("MOTION_TRACKING", tracking == MOTION_TRACKING_ON ? "yes" : "no");
+    /* always republish: HA shows the requested state until it hears back */
+    if (ir != NONE || mic != NONE || cruise != NONE || tracking != NONE)
+        system(CONF2MQTT_SCRIPT " camera >/dev/null 2>&1 &");
+    (void) changed;
+}
+
+/* Motion tracking. campipe's detector keeps MOTION_XY_FILE at "<seq> <x> <y>"
+ * (centre of the motion, permille of the frame); when it is off-centre we turn
+ * towards it, with PTZ_MOVING_MARKER up so the detector ignores our own turn.
+ * After TRACK_HOME_S without motion we go back to preset 0 (Home), if set.
+ *
+ * TRACK_FOV_X/Y: the frame width/height in driver units (27 steps each),
+ * measured on the h20 (centre of the wide-angle lens; the edges are compressed). */
+#define TRACK_PID_FILE    "/tmp/ptz_track.pid"
+#define MOTION_XY_FILE    MARKER_DIR "/motion_xy"
+#define PTZ_MOVING_MARKER MARKER_DIR "/ptz_moving"
+#define TRACK_FOV_X       1000
+#define TRACK_FOV_Y       300
+#define TRACK_DEAD_ZONE   150     /* permille off-centre we tolerate */
+#define TRACK_GAIN        80      /* percent of the offset to correct per step */
+#define TRACK_SETTLE_MS   800
+#define TRACK_HOME_S      30
+
+static int read_motion_xy(unsigned int *seq, int *x, int *y)
+{
+    FILE *f = fopen(MOTION_XY_FILE, "r");
+    int n;
+
+    if (f == NULL)
+        return -1;
+    n = fscanf(f, "%u %d %d", seq, x, y);
+    fclose(f);
+    return n == 3 ? 0 : -1;
+}
+
+static void track_jump(int x, int y)
+{
+    int fd = open(PTZ_MOVING_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd >= 0)
+        close(fd);
+    touch_manual();             /* pause the cruise, if any */
+    native_ptz_jump(x, y);
+    usleep(TRACK_SETTLE_MS * 1000);
+    unlink(PTZ_MOVING_MARKER);
+}
+
+static int track_start()
+{
+    unsigned int seq, last_seq = 0;
+    int mx, my, cur_x, cur_y, dx, dy, away = 0;
+    time_t last_motion = 0;
+    double hx, hy;
+
+    daemon_stop(TRACK_PID_FILE);
+    if (!daemon_start(TRACK_PID_FILE))
+        return 0;
+    if (read_motion_xy(&seq, &mx, &my) == 0)
+        last_seq = seq;         /* only react to motion from now on */
+
+    while (1) {
+        usleep(200 * 1000);
+        if (read_motion_xy(&seq, &mx, &my) == 0 && seq != last_seq) {
+            last_seq = seq;
+            last_motion = time(NULL);
+            dx = mx - 500;
+            dy = my - 500;
+            if (abs(dx) < TRACK_DEAD_ZONE && abs(dy) < TRACK_DEAD_ZONE)
+                continue;
+            if (read_ptz(&cur_x, &cur_y) != 0)
+                continue;
+            /* motion right of centre -> pan right, which lowers x; below -> raise y */
+            if (abs(dx) < TRACK_DEAD_ZONE)
+                dx = 0;
+            if (abs(dy) < TRACK_DEAD_ZONE)
+                dy = 0;
+            track_jump(cur_x - dx * TRACK_FOV_X / 1000 * TRACK_GAIN / 100,
+                       cur_y + dy * TRACK_FOV_Y / 1000 * TRACK_GAIN / 100);
+            away = 1;
+            /* updates written before the turn describe the old view */
+            if (read_motion_xy(&seq, &mx, &my) == 0)
+                last_seq = seq;
+        } else if (away && time(NULL) - last_motion >= TRACK_HOME_S) {
+            away = 0;
+            if (read_preset(0, &hx, &hy) == 0)
+                track_jump((int) round(hx * MAX_PTZ_X / 360.0), (int) round(hy * MAX_PTZ_Y / 180.0));
+        }
+    }
+    return 0;
+}
+
 int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get_pos, int calibrate,
-               int preset, int cruise)
+               int preset, int cruise, int tracking)
 {
     int cur_x, cur_y;
 
@@ -190,6 +352,13 @@ int native_ptz(int move, int jump_abs, int jump_rel, double x, double y, int get
         cruise_stop();
     else if (cruise == CRUISE_PRESETS || cruise == CRUISE_360 || cruise == CRUISE_ON)
         return cruise_start(cruise == CRUISE_PRESETS ? CRUISE_PRESETS : CRUISE_360);
+
+    if (tracking == MOTION_TRACKING_OFF) {
+        daemon_stop(TRACK_PID_FILE);
+        unlink(PTZ_MOVING_MARKER);
+    } else if (tracking == MOTION_TRACKING_ON) {
+        return track_start();
+    }
 
     if (move != NONE || jump_abs || jump_rel || preset != NONE)
         touch_manual();
@@ -828,14 +997,16 @@ int main(int argc, char ** argv)
     if(ret != 0) {
         /* No dispatch queue: the native pipeline. PTZ still works by driving the
          * motor driver directly; everything else needs the stock stack. */
+        native_persist(ir, mic, cruise, motiontracking);
         if (native_ptz_available() &&
                 (move != NONE || jump_abs != NONE || jump_rel != NONE || get_pos != NONE || calibrate != NONE ||
                  preset != NONE || add_preset != NONE || remove_preset != NONE || set_home_position != NONE ||
-                 cruise != NONE)) {
+                 cruise != NONE || motiontracking != NONE)) {
             exit(native_ptz(move, jump_abs != NONE, jump_rel != NONE, x, y, get_pos != NONE, calibrate != NONE,
-                            preset, cruise) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+                            preset, cruise, motiontracking) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
         }
-        exit(EXIT_FAILURE);
+        /* -i/-I were handled above through the marker files */
+        exit((ir != NONE || mic != NONE) ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     if (switch_on == SWITCH_ON) {
