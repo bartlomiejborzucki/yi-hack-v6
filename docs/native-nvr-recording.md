@@ -45,6 +45,8 @@ Everything is in the web interface:
    it or within 15 seconds either side, so every event keeps a little before and
    after. This needs the native pipeline with motion detection on (the stock
    pipeline has its own motion-only setting).
+   With Home Assistant discovery on, the same option is the **Record Only Motion**
+   switch.
 
 4. **Watch your recordings.**
    Also in the **Events** page: browse recordings by date and time, and press
