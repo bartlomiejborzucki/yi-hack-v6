@@ -53,7 +53,7 @@ ensure_dirs()
     mkdir -p "$REC_DIR/$(date -d @$(( $(date +%s) + 3600 )) +%YY%mM%dD%HH)"
 }
 
-# Motion-only recording (camera.SAVE_VIDEO_ON_MOTION=yes). The recorder always
+# Motion-only recording (recording.MOTION_ONLY=yes). The recorder always
 # writes continuous segments; once a segment is finished and its post-roll has
 # passed, delete it unless there was motion within it or MOTION_MARGIN seconds
 # either side - so what stays is each event with pre- and post-roll. Motion
@@ -61,7 +61,9 @@ ensure_dirs()
 # by campipe's detector), sampled every pass into MOTION_TIMES. Only segments
 # that ended while we were watching are judged: after a reboot the motion
 # history is gone, and older recordings are left alone rather than deleted on
-# no evidence. With SAVE_VIDEO_ON_MOTION=no nothing is deleted (continuous).
+# no evidence. Native pipeline only: in stock mode nothing touches
+# MOTION_SEEN, so every segment would look motionless. With MOTION_ONLY=no
+# nothing is deleted (continuous).
 MOTION_SEEN="/tmp/ipc/motion_seen"
 MOTION_TIMES="/tmp/rec_motion_times"
 MOTION_MARGIN=15
@@ -83,8 +85,9 @@ had_motion()   # $1 = from, $2 = to (epoch)
 
 prune_record()
 {
-    local now seen save f end
+    local now seen f end
     [ -d "$REC_DIR" ] || return
+    pidof campipe > /dev/null || return
     now=$(date +%s)
     # we start before NTP: watch only from the first pass with a real clock
     if [ "$WATCH_SINCE" -lt 1600000000 ]; then
@@ -105,8 +108,10 @@ prune_record()
     awk -v t=$(( now - 7200 )) '$1 >= t' "$MOTION_TIMES" > "$MOTION_TIMES.tmp" && \
         mv "$MOTION_TIMES.tmp" "$MOTION_TIMES"
 
-    save=$(sed -n 's/^SAVE_VIDEO_ON_MOTION=//p' /home/yi-hack/config/camera.conf)
-    [ "$save" = "yes" ] || return
+    # re-read every pass: the web UI changes it without restarting us
+    MOTION_ONLY=""
+    load_config recording MOTION_ONLY 2>/dev/null
+    [ "$MOTION_ONLY" = "yes" ] || return
 
     # trailing slash: REC_DIR is a symlink to the destination, which find
     # would not descend into otherwise

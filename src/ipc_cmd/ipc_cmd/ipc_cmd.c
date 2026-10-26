@@ -71,6 +71,23 @@ void ipc_stop()
 #define CRUISE_STAY_S    10
 #define CRUISE_RESUME_S  60
 
+/* campipe's motion detector ignores frames while this exists, so a turn of
+ * ours (cruise, tracking) does not read as motion. */
+#define PTZ_MOVING_MARKER MARKER_DIR "/ptz_moving"
+
+static int marked_jump(int x, int y)
+{
+    int fd = open(PTZ_MOVING_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ret;
+
+    if (fd >= 0)
+        close(fd);
+    ret = native_ptz_jump(x, y);
+    usleep(800 * 1000);         /* let the picture settle */
+    unlink(PTZ_MOVING_MARKER);
+    return ret;
+}
+
 static int native_jump_deg(double x, double y)
 {
     return native_ptz_jump((int) round(x * MAX_PTZ_X / 360.0), (int) round(y * MAX_PTZ_Y / 180.0));
@@ -176,7 +193,7 @@ static int cruise_start(int mode)
                     continue;
                 found = 1;
                 cruise_pause(0);
-                native_jump_deg(x, y);
+                marked_jump((int) round(x * MAX_PTZ_X / 360.0), (int) round(y * MAX_PTZ_Y / 180.0));
                 cruise_pause(CRUISE_STAY_S);
             }
             if (!found)
@@ -186,7 +203,7 @@ static int cruise_start(int mode)
             for (i = 0; i < 2; i++) {
                 cruise_pause(0);
                 if (read_ptz(&cur_x, &cur_y) == 0)
-                    native_ptz_jump(i == 0 ? INT_MAX : 0, cur_y);
+                    marked_jump(i == 0 ? INT_MAX : 0, cur_y);
                 cruise_pause(CRUISE_STAY_S / 2);
             }
         }
@@ -269,19 +286,17 @@ static void native_persist(int ir, int mic, int cruise, int tracking,
 
 /* Motion tracking. campipe's detector keeps MOTION_XY_FILE at "<seq> <x> <y>"
  * (centre of the motion, permille of the frame); when it is off-centre we turn
- * towards it, with PTZ_MOVING_MARKER up so the detector ignores our own turn.
+ * towards it (marked_jump, so the detector ignores our own turn).
  * After TRACK_HOME_S without motion we go back to preset 0 (Home), if set.
  *
  * TRACK_FOV_X/Y: the frame width/height in driver units (27 steps each),
  * measured on the h20 (centre of the wide-angle lens; the edges are compressed). */
 #define TRACK_PID_FILE    "/tmp/ptz_track.pid"
 #define MOTION_XY_FILE    MARKER_DIR "/motion_xy"
-#define PTZ_MOVING_MARKER MARKER_DIR "/ptz_moving"
 #define TRACK_FOV_X       1000
 #define TRACK_FOV_Y       300
 #define TRACK_DEAD_ZONE   150     /* permille off-centre we tolerate */
 #define TRACK_GAIN        80      /* percent of the offset to correct per step */
-#define TRACK_SETTLE_MS   800
 #define TRACK_HOME_S      30
 
 static int read_motion_xy(unsigned int *seq, int *x, int *y)
@@ -298,14 +313,8 @@ static int read_motion_xy(unsigned int *seq, int *x, int *y)
 
 static void track_jump(int x, int y)
 {
-    int fd = open(PTZ_MOVING_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-    if (fd >= 0)
-        close(fd);
     touch_manual();             /* pause the cruise, if any */
-    native_ptz_jump(x, y);
-    usleep(TRACK_SETTLE_MS * 1000);
-    unlink(PTZ_MOVING_MARKER);
+    marked_jump(x, y);
 }
 
 static int track_start()

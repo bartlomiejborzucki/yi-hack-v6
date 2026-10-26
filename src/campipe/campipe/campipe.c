@@ -356,7 +356,7 @@ static HI_S32 f22_isp_init(void)
 /* AE limits. The F22 plugin is the stock one, built against the 1.0.4.0 SDK;
  * logged here so the ranges the AE actually runs with are visible, with env
  * overrides (CAMPIPE_AE_<FIELD>_MAX) for the ones the plugin gets wrong. */
-static void ae_range(const char *name, ISP_AE_RANGE_S *r)
+static int ae_range(const char *name, ISP_AE_RANGE_S *r)
 {
     char env[48];
     const char *e;
@@ -365,28 +365,32 @@ static void ae_range(const char *name, ISP_AE_RANGE_S *r)
     e = getenv(env);
     SAMPLE_PRT("AE %s range [%u, %u]%s%s\n", name, r->u32Min, r->u32Max,
                (e && *e) ? " -> max " : "", (e && *e) ? e : "");
-    if (e && *e)
-        r->u32Max = strtoul(e, NULL, 0);
+    if (!(e && *e))
+        return 0;
+    r->u32Max = strtoul(e, NULL, 0);
+    return 1;
 }
 
 static void ae_tune(void)
 {
     ISP_EXPOSURE_ATTR_S ea;
     HI_S32 ret;
+    int changed = 0;
 
     if ((ret = HI_MPI_ISP_GetExposureAttr(0, &ea)) != HI_SUCCESS) {
         SAMPLE_PRT("ISP_GetExposureAttr failed %#x\n", ret);
         return;
     }
-    ae_range("EXPTIME", &ea.stAuto.stExpTimeRange);
-    ae_range("AGAIN", &ea.stAuto.stAGainRange);
-    ae_range("DGAIN", &ea.stAuto.stDGainRange);
-    ae_range("ISPDGAIN", &ea.stAuto.stISPDGainRange);
-    ae_range("SYSGAIN", &ea.stAuto.stSysGainRange);
+    changed |= ae_range("EXPTIME", &ea.stAuto.stExpTimeRange);
+    changed |= ae_range("AGAIN", &ea.stAuto.stAGainRange);
+    changed |= ae_range("DGAIN", &ea.stAuto.stDGainRange);
+    changed |= ae_range("ISPDGAIN", &ea.stAuto.stISPDGainRange);
+    changed |= ae_range("SYSGAIN", &ea.stAuto.stSysGainRange);
     SAMPLE_PRT("AE gain threshold %u, mode %d, compensation %u, antiflicker %d\n",
                ea.stAuto.u32GainThreshold, ea.stAuto.enAEMode, ea.stAuto.u8Compensation,
                ea.stAuto.stAntiflicker.bEnable);
-    if ((ret = HI_MPI_ISP_SetExposureAttr(0, &ea)) != HI_SUCCESS)
+    /* untouched unless overridden */
+    if (changed && (ret = HI_MPI_ISP_SetExposureAttr(0, &ea)) != HI_SUCCESS)
         SAMPLE_PRT("ISP_SetExposureAttr failed %#x\n", ret);
 }
 
