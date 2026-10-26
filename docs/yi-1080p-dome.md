@@ -31,6 +31,7 @@ Xiaomi stack off without losing anything you'd miss.
 - **Baby crying detection**: listens for the high-pitched, repeated bursts of
   a cry, which normal talking does not trigger. It is a simple detector, not
   Xiaomi's.
+- **Speaker**: two-way audio through the RTSP backchannel, as on the y20.
 - **Motion-only recording** with the [Native NVR](native-nvr-recording.md).
 - Every setting changed from Home Assistant or the web UI is saved and survives
   a reboot.
