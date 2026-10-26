@@ -43,6 +43,7 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <limits.h>
+#include <math.h>
 
 #include "sample_comm.h"
 #include "hi_ive.h"
@@ -96,6 +97,10 @@
  * detector skips those frames and re-seeds its reference afterwards, or the
  * turn itself would read as motion. */
 #define MOTION_XY_FILE    IPC_DIR "/motion_xy"
+/* Touched (at most once a second) on every tick that sees motion: its mtime is
+ * the last moment of motion, which wd_record.sh uses to keep only the recording
+ * segments around motion. */
+#define MOTION_SEEN_FILE  IPC_DIR "/motion_seen"
 #define PTZ_MOVING_MARKER IPC_DIR "/ptz_moving"
 #define NIGHT_MARKER    IPC_DIR "/night"
 
@@ -161,6 +166,12 @@ static AUDIO_SAMPLE_RATE_E g_audio_rate = AUDIO_SAMPLE_RATE_8000;
 
 static VIDEO_NORM_E g_norm = VIDEO_ENCODING_MODE_PAL;   /* SAMPLE default */
 static volatile int g_stop = 0;
+
+static int env_int(const char *name, int def)
+{
+    const char *e = getenv(name);
+    return (e && *e) ? atoi(e) : def;
+}
 
 static void *g_sns_handle;
 static int (*g_sns_unreg)(void);
@@ -708,6 +719,7 @@ static void *md_thread(void *arg)
     VIDEO_FRAME_INFO_S prev, cur;
     int have_prev = 0, motion = 0, on_ticks = 0;
     unsigned int xy_seq = 0;
+    time_t seen_at = 0;
     time_t last_move = 0;
     HI_U32 sad_stride = (W_MD + 15) & ~15u;    /* IVE wants a 16-aligned stride */
     HI_S32 ret;
@@ -825,6 +837,11 @@ static void *md_thread(void *arg)
         /* debounce -> edges */
         if (moved) {
             last_move = time(NULL);
+            if (last_move != seen_at) {
+                FILE *fp = fopen(MOTION_SEEN_FILE, "w");
+                if (fp) fclose(fp);
+                seen_at = last_move;
+            }
             if (!motion && ++on_ticks >= START_TICKS) {
                 FILE *fp = fopen(MOTION_MARKER, "w");
                 if (fp) fclose(fp);
@@ -1249,6 +1266,194 @@ static void mic_mute_tick(int *muted, int *countdown, int period)
     }
 }
 
+/* ---- sound and baby-cry detection ------------------------------------------
+ *
+ * In stock mode rmm ran these and dispatch's queue carried the events; here
+ * they run on the mic frames ai_loop_aac already has in hand (the G.711 path
+ * binds AENC straight to AI, so it has none). Events go out on the marker bus
+ * under the same names ipc2file uses in stock mode, which mqttv4 watches.
+ *
+ * Sound: per-frame level in dB re 1 LSB (0..90), against an adaptive noise
+ * floor (falls fast, rises ~1dB/s) so a fan or a fridge does not count. A sound
+ * is >= SOUND_SENSITIVITY dB, >= SD_OVER_FLOOR_DB above the floor, for
+ * SD_MIN_MS. SOUND_SENSITIVITY is therefore a threshold: 30 hears a whisper,
+ * 90 only a bang.
+ *
+ * Baby crying: the cry fundamental sits at 300-650 Hz, an adult voice at
+ * 85-255 Hz. A frame is cry-like when it is loud and its autocorrelation has a
+ * strong peak (voiced) at a 280-700 Hz period. A cry comes in sustained bursts
+ * between breaths, so it takes SD_CRY_BURSTS bursts of >= SD_CRY_BURST_MS within
+ * SD_CRY_WINDOW_S. A heuristic, not rmm's classifier - but talking does not
+ * trigger it, and a short squeal does not either.
+ *
+ * Settings follow camera.conf (SOUND_DETECTION, SOUND_SENSITIVITY,
+ * BABY_CRYING_DETECT), which `ipc_cmd -b/-n/-B` maintains, re-read every few
+ * seconds. CAMPIPE_SD_DEBUG=N logs the levels every N seconds. */
+#define SOUND_MARKER        IPC_DIR "/sound_detection"
+#define CRY_MARKER          IPC_DIR "/baby_crying"
+#define CAMERA_CONF         "/home/yi-hack/config/camera.conf"
+#define SD_CONF_PERIOD_S    5
+#define SD_OVER_FLOOR_DB    10.0f
+#define SD_MIN_MS           120
+#define SD_HOLD_S           30     /* one event per this long, extended by sound */
+#define SD_CRY_OVER_FLOOR_DB 12.0f
+#define SD_CRY_MIN_DB       45.0f
+#define SD_CRY_VOICED_PCT   55     /* normalised autocorrelation peak, percent */
+#define SD_CRY_BURST_MS     400
+#define SD_CRY_BURSTS       3
+#define SD_CRY_WINDOW_S     10
+#define SD_CRY_HOLD_S       60
+
+typedef struct {
+    int on, cry_on, sens;          /* from camera.conf */
+    time_t conf_at;
+    float floor;                   /* noise floor, dB; < 0 until the first frame */
+    int loud_ms, cry_ms, cry_gap, cry_counted;
+    time_t bursts[SD_CRY_BURSTS];  /* ring of the last burst times */
+    int burst_idx;
+    time_t sound_until, cry_until;
+    int debug;
+    time_t debug_at;
+    float peak_db;
+} sd_state_t;
+
+static void sd_read_conf(sd_state_t *sd)
+{
+    FILE *f = fopen(CAMERA_CONF, "r");
+    char line[128];
+
+    if (f == NULL)
+        return;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (!strncmp(line, "SOUND_DETECTION=", 16))
+            sd->on = !strncmp(line + 16, "yes", 3);
+        else if (!strncmp(line, "SOUND_SENSITIVITY=", 18))
+            sd->sens = atoi(line + 18);
+        else if (!strncmp(line, "BABY_CRYING_DETECT=", 19))
+            sd->cry_on = !strncmp(line + 19, "yes", 3);
+    }
+    fclose(f);
+    if (sd->sens < 20 || sd->sens > 95)
+        sd->sens = 50;
+}
+
+static void sd_marker(const char *path, int on)
+{
+    if (on) {
+        FILE *fp = fopen(path, "w");
+        if (fp)
+            fclose(fp);
+    } else {
+        remove(path);
+    }
+}
+
+/* Voiced with a period in the cry band? Normalised autocorrelation peak. */
+static int sd_cry_pitch(const HI_S16 *x, int n, int rate)
+{
+    int lag, lo = rate / 700, hi = rate / 280, i;
+    long long r0 = 0, r, best = 0;
+
+    if (hi >= n / 2)
+        hi = n / 2 - 1;
+    for (i = 0; i < n; i++)
+        r0 += (int) x[i] * x[i];
+    if (r0 == 0)
+        return 0;
+    for (lag = lo; lag <= hi; lag++) {
+        r = 0;
+        for (i = 0; i + lag < n; i++)
+            r += (int) x[i] * x[i + lag];
+        /* compensate the shorter overlap */
+        r = r * n / (n - lag);
+        if (r > best)
+            best = r;
+    }
+    return best * 100 >= r0 * SD_CRY_VOICED_PCT;
+}
+
+static void sd_process(sd_state_t *sd, const HI_S16 *x, int n, int rate)
+{
+    long long sum = 0;
+    float db;
+    int i, frame_ms, loud;
+    time_t now = time(NULL);
+
+    if (now - sd->conf_at >= SD_CONF_PERIOD_S) {
+        sd->conf_at = now;
+        sd_read_conf(sd);
+    }
+    if (n <= 0)
+        return;
+    frame_ms = n * 1000 / rate;
+
+    for (i = 0; i < n; i++)
+        sum += (int) x[i] * x[i];
+    db = 10.0f * log10f((float) (sum / n) + 1.0f);
+
+    if (sd->floor < 0 || db < sd->floor)
+        sd->floor = (sd->floor < 0) ? db : sd->floor + (db - sd->floor) * 0.2f;
+    else
+        sd->floor += 1.0f * frame_ms / 1000;
+    if (db > sd->peak_db)
+        sd->peak_db = db;
+
+    if (sd->debug > 0 && now - sd->debug_at >= sd->debug) {
+        SAMPLE_PRT("SD: level %.1f dB, peak %.1f, floor %.1f (sound %s >= %d, cry %s)\n", db,
+                   sd->peak_db, sd->floor, sd->on ? "on" : "off", sd->sens, sd->cry_on ? "on" : "off");
+        sd->debug_at = now;
+        sd->peak_db = 0;
+    }
+
+    /* sound */
+    loud = sd->on && db >= sd->sens && db >= sd->floor + SD_OVER_FLOOR_DB;
+    sd->loud_ms = loud ? sd->loud_ms + frame_ms : 0;
+    if (sd->loud_ms >= SD_MIN_MS) {
+        if (sd->sound_until == 0) {
+            sd_marker(SOUND_MARKER, 1);
+            SAMPLE_PRT("SD: sound START (%.1f dB, floor %.1f)\n", db, sd->floor);
+        }
+        sd->sound_until = now + SD_HOLD_S;
+    }
+    if (sd->sound_until && now >= sd->sound_until) {
+        sd_marker(SOUND_MARKER, 0);
+        sd->sound_until = 0;
+        SAMPLE_PRT("SD: sound STOP\n");
+    }
+
+    /* baby crying */
+    if (sd->cry_on && db >= SD_CRY_MIN_DB && db >= sd->floor + SD_CRY_OVER_FLOOR_DB &&
+            sd_cry_pitch(x, n, rate)) {
+        sd->cry_ms += frame_ms;
+        sd->cry_gap = 0;
+    } else if (++sd->cry_gap > 1) {     /* tolerate a single odd frame */
+        sd->cry_ms = 0;
+        sd->cry_counted = 0;
+    }
+    if (sd->cry_ms >= SD_CRY_BURST_MS && !sd->cry_counted) {
+        int k, recent = 0;
+
+        sd->cry_counted = 1;
+        sd->bursts[sd->burst_idx] = now;
+        sd->burst_idx = (sd->burst_idx + 1) % SD_CRY_BURSTS;
+        for (k = 0; k < SD_CRY_BURSTS; k++)
+            if (sd->bursts[k] && now - sd->bursts[k] <= SD_CRY_WINDOW_S)
+                recent++;
+        if (recent >= SD_CRY_BURSTS) {
+            if (sd->cry_until == 0) {
+                sd_marker(CRY_MARKER, 1);
+                SAMPLE_PRT("SD: baby crying START\n");
+            }
+            sd->cry_until = now + SD_CRY_HOLD_S;
+        }
+    }
+    if (sd->cry_until && now >= sd->cry_until) {
+        sd_marker(CRY_MARKER, 0);
+        sd->cry_until = 0;
+        SAMPLE_PRT("SD: baby crying STOP\n");
+    }
+}
+
 /* Open (or reopen) the codec's FIFO for writing. ENXIO until rRTSPServer attaches
  * as reader, which is normal and not worth logging. */
 static int audio_fifo_open(const char *path)
@@ -1398,6 +1603,14 @@ static void ai_loop_aac(int mute_period)
      * Both values sit inside vo-aacenc's accepted window (>= 4000 and
      * <= sampleRate*6 for mono), so neither gets silently rewritten by SetParam. */
     int bitrate = (rate >= 16000) ? 32000 : 24000;
+    sd_state_t sd;
+
+    memset(&sd, 0, sizeof(sd));
+    sd.floor = -1.0f;
+    sd.debug = env_int("CAMPIPE_SD_DEBUG", 0);
+    mkdir(IPC_DIR, 0755);
+    remove(SOUND_MARKER);
+    remove(CRY_MARKER);
 
     /* AI only queues frames for a user-space reader when the channel has a NON-ZERO
      * user frame depth. With the default 0, HI_MPI_AI_GetFrame never returns a frame
@@ -1463,6 +1676,7 @@ static void ai_loop_aac(int mute_period)
          * `points = u32Len >> enBitwidth`), so halve it for 16-bit samples. */
         src  = (const HI_S16 *)frame.pVirAddr[0];
         have = (int)frame.u32Len / 2;
+        sd_process(&sd, src, have, rate);
         while (have > 0) {
             int n = AAC_FRAME - fill;
             if (n > have) n = have;
@@ -1564,12 +1778,7 @@ static void *ai_thread(void *arg)
 #define DN_PROBE_MIN_MS     2000   /* AE settle window after the IR goes dark   */
 #define DN_PROBE_MAX_MS     8000
 #define DN_SHORT_DAY_S      120    /* a day shorter than this was a false exit  */
-
-static int env_int(const char *name, int def)
-{
-    const char *e = getenv(name);
-    return (e && *e) ? atoi(e) : def;
-}
+#define DN_START_GRACE_S    20     /* the AE reads its ceiling while it converges */
 
 /* IR LEDs on (ramped, as rmm does) or off. */
 static void dn_leds(int fd, int on)
@@ -1656,7 +1865,7 @@ static void *daynight_thread(void *arg)
     int night = -1, ir_on = -1, want, want_ir;
     int probe_base = env_int("CAMPIPE_DN_PROBE_S", DN_PROBE_S);
     int above = 0, below = 0, probe_every = probe_base;
-    time_t day_since = 0, last_probe = 0, now;
+    time_t day_since = 0, last_probe = 0, now, started = time(NULL);
     ISP_EXP_INFO_S ei;
 
     memset(&ei, 0, sizeof(ei));
@@ -1690,15 +1899,15 @@ static void *daynight_thread(void *arg)
             above = ((int) iso >= iso_night) ? above + 1 : 0;
             below = ((int) iso <= iso_day) ? below + 1 : 0;
             if (night < 0)
-                want = (above > 0);         /* first sample: no history yet */
-            else if (night == 0 && above >= DN_TO_NIGHT_S)
+                want = 0;   /* start in day: the AE reads its ceiling until it converges */
+            else if (night == 0 && above >= DN_TO_NIGHT_S && now - started >= DN_START_GRACE_S)
                 want = 1;
             else if (night == 1 && below >= DN_TO_DAY_S)
                 want = 0;
         }
 
         if (want != night || (want == 1 && want_ir != ir_on)) {
-            if (night == 0 && want == 1 && day_since) {
+            if (night == 0 && want == 1 && day_since > started) {
                 /* a day that did not last: the probe misread the light */
                 if (now - day_since < DN_SHORT_DAY_S)
                     probe_every = (probe_every * 2 > DN_PROBE_MAX_S) ? DN_PROBE_MAX_S : probe_every * 2;

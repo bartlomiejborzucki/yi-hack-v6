@@ -236,9 +236,11 @@ static int camera_conf_set(const char *key, const char *value)
     return changed;
 }
 
-static void native_persist(int ir, int mic, int cruise, int tracking)
+static void native_persist(int ir, int mic, int cruise, int tracking,
+                           int sound, int sound_sens, int babycrying)
 {
     int changed = 0;
+    char val[8];
 
     if (ir != NONE)
         changed |= camera_conf_set("IR", ir == IR_ON ? "yes" : "no");
@@ -249,8 +251,18 @@ static void native_persist(int ir, int mic, int cruise, int tracking)
                                    (cruise == CRUISE_OFF ? "no" : "360"));
     if (tracking != NONE)
         changed |= camera_conf_set("MOTION_TRACKING", tracking == MOTION_TRACKING_ON ? "yes" : "no");
+    /* campipe's sound detector re-reads these from camera.conf */
+    if (sound != NONE)
+        changed |= camera_conf_set("SOUND_DETECTION", sound == SOUND_DETECTION_ON ? "yes" : "no");
+    if (sound_sens != NONE) {
+        snprintf(val, sizeof(val), "%d", sound_sens);
+        changed |= camera_conf_set("SOUND_SENSITIVITY", val);
+    }
+    if (babycrying != NONE)
+        changed |= camera_conf_set("BABY_CRYING_DETECT", babycrying == BABYCRYING_ON ? "yes" : "no");
     /* always republish: HA shows the requested state until it hears back */
-    if (ir != NONE || mic != NONE || cruise != NONE || tracking != NONE)
+    if (ir != NONE || mic != NONE || cruise != NONE || tracking != NONE ||
+            sound != NONE || sound_sens != NONE || babycrying != NONE)
         system(CONF2MQTT_SCRIPT " camera >/dev/null 2>&1 &");
     (void) changed;
 }
@@ -997,7 +1009,7 @@ int main(int argc, char ** argv)
     if(ret != 0) {
         /* No dispatch queue: the native pipeline. PTZ still works by driving the
          * motor driver directly; everything else needs the stock stack. */
-        native_persist(ir, mic, cruise, motiontracking);
+        native_persist(ir, mic, cruise, motiontracking, sounddetection, soundsensitivity, babycrying);
         if (native_ptz_available() &&
                 (move != NONE || jump_abs != NONE || jump_rel != NONE || get_pos != NONE || calibrate != NONE ||
                  preset != NONE || add_preset != NONE || remove_preset != NONE || set_home_position != NONE ||
@@ -1005,8 +1017,9 @@ int main(int argc, char ** argv)
             exit(native_ptz(move, jump_abs != NONE, jump_rel != NONE, x, y, get_pos != NONE, calibrate != NONE,
                             preset, cruise, motiontracking) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
         }
-        /* -i/-I were handled above through the marker files */
-        exit((ir != NONE || mic != NONE) ? EXIT_SUCCESS : EXIT_FAILURE);
+        /* -i/-I were handled above through the marker files, -b/-n/-B by persisting */
+        exit((ir != NONE || mic != NONE || sounddetection != NONE || soundsensitivity != NONE ||
+              babycrying != NONE) ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
     if (switch_on == SWITCH_ON) {
