@@ -42,6 +42,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <limits.h>
 
 #include "sample_comm.h"
 #include "hi_ive.h"
@@ -1544,10 +1545,13 @@ static void *ai_thread(void *arg)
  * picture goes greyscale at night via VENC Color2Grey, as in rmm.
  *
  * The decision uses the AE's ISO (total gain): night when the sensor is near the
- * top of its gain for a while, day when it falls well below. The catch is that
- * our own IR lights the scene, so leaving night can make the image too dark and
- * send us straight back. Each such short day spell doubles the time ISO must stay
- * low before we try again (up to an hour); a day that holds resets it. */
+ * top of its gain for a while. Leaving night is harder, because our own IR lights
+ * the scene: on the h20 a dark room under IR reads ISO 100, the same as daylight.
+ * So while the IR is on, every DN_PROBE_S we switch it off for a few seconds and
+ * read ISO without it; day only when the room is bright on its own. With the IR
+ * off (ir_off) ISO is the ambient light anyway and a plain threshold is enough.
+ * A day that does not last (the probe misread) doubles the probe interval, up to
+ * an hour; a day that holds resets it. */
 #define CPLD_DEV            "/dev/cpld_periph"
 #define CPLD_PWM0_SET       _IO('p', 19)   /* arg: int* 0..100 - IR illuminator */
 #define CPLD_IRCUT_NIGHT    _IO('p', 21)
@@ -1555,7 +1559,10 @@ static void *ai_thread(void *arg)
 
 #define DN_TO_NIGHT_S       5      /* ISO above the night threshold this long   */
 #define DN_TO_DAY_S         10     /* ISO below the day threshold this long     */
-#define DN_TO_DAY_MAX_S     3600
+#define DN_PROBE_S          300    /* IR-off probe interval at night            */
+#define DN_PROBE_MAX_S      3600
+#define DN_PROBE_MIN_MS     2000   /* AE settle window after the IR goes dark   */
+#define DN_PROBE_MAX_MS     8000
 #define DN_SHORT_DAY_S      120    /* a day shorter than this was a false exit  */
 
 static int env_int(const char *name, int def)
@@ -1564,34 +1571,37 @@ static int env_int(const char *name, int def)
     return (e && *e) ? atoi(e) : def;
 }
 
+/* IR LEDs on (ramped, as rmm does) or off. */
+static void dn_leds(int fd, int on)
+{
+    static const int ramp[] = { 10, 50, 100 };
+    int i, pwm;
+
+    if (!on) {
+        pwm = 0;
+        ioctl(fd, CPLD_PWM0_SET, &pwm);
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        pwm = ramp[i] * env_int("CAMPIPE_IR_PWM", 100) / 100;
+        ioctl(fd, CPLD_PWM0_SET, &pwm);
+        usleep(200 * 1000);
+    }
+}
+
 static void dn_apply(int night, int ir_on)
 {
     VENC_COLOR2GREY_S grey;
-    int fd, pwm, chn;
-    static const int ramp[] = { 10, 50, 100 };
+    int fd, chn;
 
     fd = open(CPLD_DEV, O_RDWR);
     if (fd < 0) {
         SAMPLE_PRT("daynight: open %s failed: %s\n", CPLD_DEV, strerror(errno));
-    } else if (night) {
-        if (ir_on) {
-            for (chn = 0; chn < 3; chn++) {
-                pwm = ramp[chn] * env_int("CAMPIPE_IR_PWM", 100) / 100;
-                ioctl(fd, CPLD_PWM0_SET, &pwm);
-                usleep(200 * 1000);
-            }
-        } else {
-            pwm = 0;
-            ioctl(fd, CPLD_PWM0_SET, &pwm);
-        }
-        ioctl(fd, CPLD_IRCUT_NIGHT);
     } else {
-        pwm = 0;
-        ioctl(fd, CPLD_PWM0_SET, &pwm);
-        ioctl(fd, CPLD_IRCUT_DAY);
-    }
-    if (fd >= 0)
+        dn_leds(fd, night && ir_on);
+        ioctl(fd, night ? CPLD_IRCUT_NIGHT : CPLD_IRCUT_DAY);
         close(fd);
+    }
 
     grey.bColor2Grey = night ? HI_TRUE : HI_FALSE;
     for (chn = 0; chn <= VENC_JPEG_LOW; chn++)
@@ -1606,16 +1616,47 @@ static void dn_apply(int night, int ir_on)
     }
 }
 
+/* Ambient-only ISO at night: IR LEDs off until the AE settles (ISO steady
+ * within 5% over half a second, or at its ceiling), then IR back on. A probe read
+ * before the AE caught up would come out low and look like daylight. */
+static unsigned int dn_probe(void)
+{
+    ISP_EXP_INFO_S ei;
+    unsigned int iso = 0, prev = 0;
+    int fd, ms;
+
+    fd = open(CPLD_DEV, O_RDWR);
+    if (fd < 0)
+        return UINT_MAX;
+    dn_leds(fd, 0);
+    for (ms = 0; ms < DN_PROBE_MAX_MS; ms += 500) {
+        usleep(500 * 1000);
+        if (HI_MPI_ISP_QueryExposureInfo(0, &ei) != HI_SUCCESS)
+            continue;
+        prev = iso;
+        iso = ei.u32ISO;
+        if (ei.bExposureIsMAX)
+            break;
+        if (ms + 500 >= DN_PROBE_MIN_MS && prev > 0 &&
+            iso * 20 <= prev * 21 && prev * 20 <= iso * 21)
+            break;
+    }
+    dn_leds(fd, 1);
+    close(fd);
+    return iso ? iso : UINT_MAX;
+}
+
 static void *daynight_thread(void *arg)
 {
     const char *mode = (const char *) arg;
     int iso_night = env_int("CAMPIPE_ISO_NIGHT", 6000);
     int iso_day   = env_int("CAMPIPE_ISO_DAY", 1200);
     int debug     = env_int("CAMPIPE_DN_DEBUG", 0);   /* log AE every N seconds */
-    unsigned int tick = 0;
+    unsigned int tick = 0, iso = 0;
     int night = -1, ir_on = -1, want, want_ir;
-    int above = 0, below = 0, to_day = DN_TO_DAY_S;
-    time_t day_since = 0, now;
+    int probe_base = env_int("CAMPIPE_DN_PROBE_S", DN_PROBE_S);
+    int above = 0, below = 0, probe_every = probe_base;
+    time_t day_since = 0, last_probe = 0, now;
     ISP_EXP_INFO_S ei;
 
     memset(&ei, 0, sizeof(ei));
@@ -1625,40 +1666,52 @@ static void *daynight_thread(void *arg)
     while (!g_stop) {
         want_ir = (access(IR_OFF_MARKER, F_OK) != 0);
         want = night;
+        now = time(NULL);
 
         if (strcmp(mode, "night") == 0) {
             want = 1;
         } else if (strcmp(mode, "day") == 0) {
             want = 0;
+        } else if (night == 1 && ir_on == 1) {
+            /* our IR masks the ambient light: only a probe can tell */
+            if (now - last_probe >= probe_every) {
+                iso = dn_probe();
+                last_probe = time(NULL);
+                SAMPLE_PRT("daynight: probe without IR: ISO %u (day <= %d)\n", iso, iso_day);
+                if ((int) iso <= iso_day)
+                    want = 0;
+            }
         } else if (HI_MPI_ISP_QueryExposureInfo(0, &ei) == HI_SUCCESS) {
+            iso = ei.u32ISO;
             if (debug > 0 && ++tick % debug == 0)
                 SAMPLE_PRT("daynight: iso %u exp %u (t %u ag %u dg %u ispdg %u) max %d lum %u fps %u\n",
                            ei.u32ISO, ei.u32Exposure, ei.u32ExpTime, ei.u32AGain, ei.u32DGain,
                            ei.u32ISPDGain, ei.bExposureIsMAX, ei.u8AveLum, ei.u32Fps);
-            above = ((int) ei.u32ISO >= iso_night) ? above + 1 : 0;
-            below = ((int) ei.u32ISO <= iso_day) ? below + 1 : 0;
+            above = ((int) iso >= iso_night) ? above + 1 : 0;
+            below = ((int) iso <= iso_day) ? below + 1 : 0;
             if (night < 0)
                 want = (above > 0);         /* first sample: no history yet */
             else if (night == 0 && above >= DN_TO_NIGHT_S)
                 want = 1;
-            else if (night == 1 && below >= to_day)
+            else if (night == 1 && below >= DN_TO_DAY_S)
                 want = 0;
         }
 
         if (want != night || (want == 1 && want_ir != ir_on)) {
-            now = time(NULL);
             if (night == 0 && want == 1 && day_since) {
-                /* a day that did not last was our own IR leaving the scene dark */
+                /* a day that did not last: the probe misread the light */
                 if (now - day_since < DN_SHORT_DAY_S)
-                    to_day = (to_day * 2 > DN_TO_DAY_MAX_S) ? DN_TO_DAY_MAX_S : to_day * 2;
+                    probe_every = (probe_every * 2 > DN_PROBE_MAX_S) ? DN_PROBE_MAX_S : probe_every * 2;
                 else
-                    to_day = DN_TO_DAY_S;
+                    probe_every = probe_base;
             }
             if (want == 0)
                 day_since = now;
+            if (want == 1 && night != 1)
+                last_probe = now;           /* first probe one interval after dusk */
             if (want != night)
-                SAMPLE_PRT("daynight: -> %s (ISO %u, next day after %ds)\n",
-                           want ? "NIGHT" : "DAY", ei.u32ISO, to_day);
+                SAMPLE_PRT("daynight: -> %s (ISO %u, probe every %ds)\n",
+                           want ? "NIGHT" : "DAY", iso, probe_every);
             dn_apply(want, want_ir);
             night = want;
             ir_on = want_ir;
